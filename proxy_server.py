@@ -21,6 +21,69 @@ def parse_int(value: Any) -> int:
         return 0
 
 
+# ── 上游 SOCKS5 转发（自建节点） ────────────────────────────────────
+
+def connect_via_upstream_socks5(
+    target_host: str, target_port: int,
+    upstream_host: str, upstream_port: int,
+    username: str = "", password: str = "",
+    timeout: float = 20.0
+) -> socket.socket:
+    """通过上游 SOCKS5 服务器连接目标，返回已建立的 socket"""
+    sock = socket.create_connection((upstream_host, upstream_port), timeout=timeout)
+    try:
+        # 握手：选择认证方式
+        if username:
+            sock.sendall(b"\x05\x02\x00\x02")  # 支持无认证和用户名密码
+        else:
+            sock.sendall(b"\x05\x01\x00")       # 只支持无认证
+        resp = recv_exact(sock, 2)
+        if resp[0] != 5:
+            raise ConnectionError("上游不是 SOCKS5 服务器")
+        method = resp[1]
+        if method == 0xFF:
+            raise ConnectionError("上游 SOCKS5 拒绝认证方式")
+        # 用户名密码认证
+        if method == 0x02:
+            if not username:
+                raise ConnectionError("上游要求认证但未提供用户名密码")
+            u = username.encode()
+            p = password.encode()
+            auth_req = bytes([1, len(u)]) + u + bytes([len(p)]) + p
+            sock.sendall(auth_req)
+            auth_resp = recv_exact(sock, 2)
+            if auth_resp[1] != 0:
+                raise ConnectionError("上游 SOCKS5 认证失败")
+        # 发送 CONNECT 请求
+        try:
+            socket.inet_aton(target_host)
+            addr_type = 1
+            addr_bytes = socket.inet_aton(target_host)
+        except OSError:
+            addr_type = 3
+            host_bytes = target_host.encode()
+            addr_bytes = bytes([len(host_bytes)]) + host_bytes
+        port_bytes = target_port.to_bytes(2, "big")
+        sock.sendall(b"\x05\x01\x00" + bytes([addr_type]) + addr_bytes + port_bytes)
+        # 读响应
+        resp_header = recv_exact(sock, 4)
+        if resp_header[1] != 0:
+            raise ConnectionError(f"上游 SOCKS5 CONNECT 失败，代码: {resp_header[1]}")
+        # 跳过绑定地址
+        atype = resp_header[3]
+        if atype == 1:
+            recv_exact(sock, 4 + 2)
+        elif atype == 3:
+            length = recv_exact(sock, 1)[0]
+            recv_exact(sock, length + 2)
+        elif atype == 4:
+            recv_exact(sock, 16 + 2)
+        return sock
+    except Exception:
+        sock.close()
+        raise
+
+
 def recv_exact(sock: socket.socket, size: int) -> bytes:
     data = b""
     while len(data) < size:
@@ -136,7 +199,8 @@ def relay(left: socket.socket, right: socket.socket) -> None:
             dst.sendall(data)
 
 
-def handle_http(client: socket.socket, first_line: str, tun_dev: str) -> None:
+def handle_http(client: socket.socket, first_line: str, tun_dev: str,
+                upstream: dict | None = None) -> None:
     """处理 HTTP CONNECT 代理"""
     upstream = None
     try:
@@ -165,14 +229,22 @@ def handle_http(client: socket.socket, first_line: str, tun_dev: str) -> None:
             host, port = host_port, 443
 
         try:
-            upstream = create_tun_connection(host, port, tun_dev)
+            if upstream:
+                # 自建 SOCKS5 节点模式
+                conn = connect_via_upstream_socks5(
+                    host, port,
+                    upstream["host"], upstream["port"],
+                    upstream.get("username", ""), upstream.get("password", "")
+                )
+            else:
+                conn = create_tun_connection(host, port, tun_dev)
         except Exception as e:
             err_msg = f"HTTP/1.1 502 Bad Gateway\r\nX-Error: {e}\r\n\r\n"
             client.sendall(err_msg.encode())
             return
 
         client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        relay(client, upstream)
+        relay(client, conn)
     except Exception:
         pass
     finally:
@@ -183,9 +255,10 @@ def handle_http(client: socket.socket, first_line: str, tun_dev: str) -> None:
                 pass
 
 
-def handle_socks5(client: socket.socket, tun_dev: str) -> None:
+def handle_socks5(client: socket.socket, tun_dev: str,
+                  upstream: dict | None = None) -> None:
     """处理 SOCKS5 代理"""
-    upstream = None
+    conn = None
     try:
         methods_count = recv_exact(client, 1)[0]
         recv_exact(client, methods_count)
@@ -211,30 +284,38 @@ def handle_socks5(client: socket.socket, tun_dev: str) -> None:
         port = int.from_bytes(recv_exact(client, 2), "big")
 
         try:
-            upstream = create_tun_connection(host, port, tun_dev)
-        except Exception as e:
+            if upstream:
+                conn = connect_via_upstream_socks5(
+                    host, port,
+                    upstream["host"], upstream["port"],
+                    upstream.get("username", ""), upstream.get("password", "")
+                )
+            else:
+                conn = create_tun_connection(host, port, tun_dev)
+        except Exception:
             client.sendall(b"\x05\x05\x00\x01" + b"\x00" * 6)
             return
 
         client.sendall(b"\x05\x00\x00\x01" + b"\x00" * 6)
-        relay(client, upstream)
+        relay(client, conn)
     except Exception:
         pass
     finally:
-        if upstream:
+        if conn:
             try:
-                upstream.close()
+                conn.close()
             except Exception:
                 pass
 
 
-def handle_client(client: socket.socket, tun_dev: str) -> None:
+def handle_client(client: socket.socket, tun_dev: str,
+                  upstream_socks5: dict | None = None) -> None:
     try:
         first_byte = client.recv(1)
         if not first_byte:
             return
         if first_byte == b"\x05":
-            handle_socks5(client, tun_dev)
+            handle_socks5(client, tun_dev, upstream_socks5)
         else:
             # HTTP
             rest = b""
@@ -244,7 +325,7 @@ def handle_client(client: socket.socket, tun_dev: str) -> None:
                     return
                 rest += chunk
             first_line = (first_byte + rest).decode(errors="replace").split("\n")[0].strip()
-            handle_http(client, first_line, tun_dev)
+            handle_http(client, first_line, tun_dev, upstream_socks5)
     except Exception:
         pass
     finally:
@@ -255,9 +336,14 @@ def handle_client(client: socket.socket, tun_dev: str) -> None:
 
 
 class SlotProxyServer:
-    """单个 slot 的代理服务器（绑定特定 tun 网卡）"""
+    """单个 slot 的代理服务器（绑定特定 tun 网卡，或转发到上游 SOCKS5）"""
 
     def __init__(self, slot_id: int, tun_dev: str, listen_host: str, listen_port: int):
+        self.slot_id = slot_id
+        self.tun_dev = tun_dev
+        self.listen_host = listen_host
+        self.listen_port = listen_port
+        self.upstream_socks5: dict | None = None  # 自建节点时设置
         self.slot_id = slot_id
         self.tun_dev = tun_dev
         self.listen_host = listen_host
@@ -283,7 +369,7 @@ class SlotProxyServer:
                 client, _ = self._server.accept()
                 threading.Thread(
                     target=handle_client,
-                    args=(client, self.tun_dev),
+                    args=(client, self.tun_dev, self.upstream_socks5),
                     daemon=True
                 ).start()
             except socket.timeout:
@@ -293,6 +379,10 @@ class SlotProxyServer:
                     import traceback
                     traceback.print_exc()
                 break
+
+    def set_upstream_socks5(self, upstream: dict | None) -> None:
+        """切换到自建 SOCKS5 节点模式（传 None 恢复 tun 模式）"""
+        self.upstream_socks5 = upstream
 
     def stop(self) -> None:
         self._running = False
