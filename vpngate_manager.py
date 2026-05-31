@@ -44,6 +44,7 @@ ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("VPNGATE_DATA_DIR", str(ROOT_DIR / "vpngate_data")))
 CONFIG_DIR = DATA_DIR / "configs"
 NODES_FILE = DATA_DIR / "nodes.json"
+CUSTOM_NODES_FILE = DATA_DIR / "custom_nodes.json"
 STATE_FILE = DATA_DIR / "state.json"
 UI_AUTH_FILE = DATA_DIR / "ui_auth.json"
 ROUTING_FILE = DATA_DIR / "routing.json"
@@ -582,6 +583,11 @@ def stop_slot(slot_id: int) -> None:
     st.latency_ms = 0
     st.status_msg = "已断开"
 
+    # 清除代理服务器的上游 SOCKS5 配置
+    srv = proxy_mod._proxy_slots.get(slot_id)
+    if srv:
+        srv.set_upstream_socks5(None)
+
     # 清理节点 active_slot 标记
     with lock:
         nodes = read_json(NODES_FILE, [])
@@ -589,6 +595,64 @@ def stop_slot(slot_id: int) -> None:
             if n.get("active_slot") == slot_id:
                 n["active_slot"] = -1
         write_json(NODES_FILE, nodes)
+
+
+def connect_custom_socks5(slot_id: int, node: dict) -> str:
+    """连接自建 SOCKS5 节点（不需要 OpenVPN，直接设置上游转发）"""
+    st = slot_states[slot_id]
+    if st.is_connecting:
+        return "正在连接中，请稍候"
+    st.is_connecting = True
+    st.status_msg = "连接自建节点..."
+    try:
+        stop_slot(slot_id)
+        host = node["host"]
+        port = int(node["port"])
+        username = node.get("username", "")
+        password = node.get("password", "")
+
+        # 测试连通性
+        st.status_msg = "测试节点连通性..."
+        lat = vpn_utils.ping_latency_ms(host, port)
+        if lat == 0:
+            raise RuntimeError(f"无法连接到 {host}:{port}")
+        st.latency_ms = lat
+
+        # 设置代理服务器的上游转发
+        srv = proxy_mod._proxy_slots.get(slot_id)
+        if srv:
+            srv.set_upstream_socks5({
+                "host": host, "port": port,
+                "username": username, "password": password
+            })
+
+        st.node_id = node["id"]
+        st.status_msg = f"检测出口..."
+
+        # 检测出口 IP
+        proxy_result = check_slot_proxy(slot_id)
+        st.proxy_ok = proxy_result["ok"]
+        st.proxy_ip = proxy_result.get("ip", "")
+        st.status_msg = f"已连接 | 出口IP: {st.proxy_ip}" if st.proxy_ok else "已连接 | 出口检测失败"
+
+        # 更新自建节点的 active_slot
+        custom_nodes = read_json(CUSTOM_NODES_FILE, [])
+        for n in custom_nodes:
+            if n["id"] == node["id"]:
+                n["active_slot"] = slot_id
+            elif n.get("active_slot") == slot_id:
+                n["active_slot"] = -1
+        write_json(CUSTOM_NODES_FILE, custom_nodes)
+
+        log("INFO", f"Slot{slot_id}", f"自建节点 {node['name']} 连接成功，出口: {st.proxy_ip}")
+        return f"连接成功: {node['name']}"
+    except Exception as e:
+        st.status_msg = f"连接失败: {e}"
+        log("ERROR", f"Slot{slot_id}", str(e))
+        stop_slot(slot_id)
+        raise
+    finally:
+        st.is_connecting = False
 
 
 def connect_slot(slot_id: int, node_id: str) -> str:
@@ -883,7 +947,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <div class="tabs">
     <div class="tab active" onclick="switchTab('dashboard')">📊 控制台</div>
     <div class="tab" onclick="switchTab('nodes')">🗂 节点列表</div>
-    <div class="tab" onclick="switchTab('filter')">🔧 过滤设置</div>
+    <div class="tab" onclick="switchTab('custom')">🔧 自建节点</div>
+    <div class="tab" onclick="switchTab('filter')">🎯 过滤设置</div>
     <div class="tab" onclick="switchTab('routing')">🔀 协议路由</div>
     <div class="tab" onclick="switchTab('logs')">📋 日志</div>
   </div>
@@ -980,6 +1045,49 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <tbody id="nodeTable"></tbody>
         </table>
       </div>
+    </div>
+  </div>
+
+  <!-- 自建节点 -->
+  <div class="content page" id="page-custom">
+    <div class="card">
+      <h2>➕ 添加自建 SOCKS5 节点</h2>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px">
+        <div class="filter-group">
+          <label>备注名称 *</label>
+          <input class="input" id="cn-name" placeholder="例如：我的JP节点">
+        </div>
+        <div class="filter-group">
+          <label>服务器地址 *</label>
+          <input class="input" id="cn-host" placeholder="IP 或域名">
+        </div>
+        <div class="filter-group">
+          <label>端口 *</label>
+          <input class="input" id="cn-port" type="number" placeholder="1080">
+        </div>
+        <div class="filter-group">
+          <label>用户名（可选）</label>
+          <input class="input" id="cn-user" placeholder="留空表示无认证">
+        </div>
+        <div class="filter-group">
+          <label>密码（可选）</label>
+          <input class="input" id="cn-pass" type="password" placeholder="留空表示无认证">
+        </div>
+        <div class="filter-group">
+          <label>备注说明（可选）</label>
+          <input class="input" id="cn-note" placeholder="例如：住宅IP 美国">
+        </div>
+      </div>
+      <button class="btn btn-primary" onclick="addCustomNode()">➕ 添加节点</button>
+    </div>
+    <div class="card">
+      <h2>📋 自建节点列表</h2>
+      <table>
+        <thead>
+          <tr><th>名称</th><th>地址</th><th>端口</th><th>认证</th><th>延迟</th><th>状态</th><th>备注</th><th>操作</th></tr>
+        </thead>
+        <tbody id="customNodeTable"></tbody>
+      </table>
     </div>
   </div>
 
@@ -1102,16 +1210,90 @@ function doLogout() {
 
 function switchTab(name) {
   document.querySelectorAll('.tab').forEach((t,i)=>{
-    const pages = ['dashboard','nodes','filter','routing','logs'];
+    const pages = ['dashboard','nodes','custom','filter','routing','logs'];
     t.classList.toggle('active', pages[i]===name);
   });
   document.querySelectorAll('.page').forEach(p=>{
     p.classList.toggle('active', p.id==='page-'+name);
   });
   if (name==='nodes') loadNodes();
+  if (name==='custom') loadCustomNodes();
   if (name==='filter') loadFilter();
   if (name==='routing') loadRouting();
   if (name==='logs') loadLogs();
+}
+
+async function loadCustomNodes() {
+  const d = await api('/api/custom_nodes');
+  if (!d) return;
+  const tbody = document.getElementById('customNodeTable');
+  tbody.innerHTML = '';
+  const nodes = d.nodes || [];
+  if (!nodes.length) {
+    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;padding:24px;color:#718096">暂无自建节点</td></tr>';
+    return;
+  }
+  nodes.forEach(n => {
+    const tr = document.createElement('tr');
+    const hasAuth = n.username ? '有认证' : '无认证';
+    const slotLabel = n.active_slot >= 0 ? `<span class="pill on">槽${n.active_slot+1}</span>` : '<span class="pill off">未连接</span>';
+    tr.innerHTML = `
+      <td style="font-weight:600">${n.name}</td>
+      <td style="font-family:monospace">${n.host}</td>
+      <td style="font-family:monospace">${n.port}</td>
+      <td><span class="tag ${n.username?'available':'unknown'}">${hasAuth}</span></td>
+      <td>${n.latency_ms ? n.latency_ms+'ms' : '-'}</td>
+      <td>${slotLabel}</td>
+      <td style="color:#718096;font-size:12px">${n.note||''}</td>
+      <td>
+        <button class="btn btn-sm btn-primary" onclick="connectCustomNode('${n.id}',0)">→槽1</button>
+        <button class="btn btn-sm btn-grey" onclick="connectCustomNode('${n.id}',1)">→槽2</button>
+        <button class="btn btn-sm btn-danger" onclick="deleteCustomNode('${n.id}')">删除</button>
+      </td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+async function addCustomNode() {
+  const name = document.getElementById('cn-name').value.trim();
+  const host = document.getElementById('cn-host').value.trim();
+  const port = parseInt(document.getElementById('cn-port').value);
+  const username = document.getElementById('cn-user').value.trim();
+  const password = document.getElementById('cn-pass').value;
+  const note = document.getElementById('cn-note').value.trim();
+  if (!name || !host || !port) return showToast('名称、地址、端口为必填项', true);
+  const r = await api('/api/custom_nodes', {
+    method: 'POST',
+    body: JSON.stringify({action:'add', name, host, port, username, password, note})
+  });
+  if (r && r.ok) {
+    showToast('节点已添加');
+    ['cn-name','cn-host','cn-port','cn-user','cn-pass','cn-note'].forEach(id=>{
+      document.getElementById(id).value='';
+    });
+    loadCustomNodes();
+  } else {
+    showToast((r&&r.error)||'添加失败', true);
+  }
+}
+
+async function deleteCustomNode(nodeId) {
+  const r = await api('/api/custom_nodes', {
+    method: 'POST',
+    body: JSON.stringify({action:'delete', node_id: nodeId})
+  });
+  showToast(r&&r.ok ? '已删除' : '删除失败', !(r&&r.ok));
+  loadCustomNodes();
+}
+
+async function connectCustomNode(nodeId, slot) {
+  showToast(`正在连接自建节点到槽${slot+1}...`);
+  const r = await api('/api/connect_custom', {
+    method: 'POST',
+    body: JSON.stringify({node_id: nodeId, slot_id: slot})
+  });
+  showToast(r&&r.ok ? r.message : (r&&r.error)||'连接失败', !(r&&r.ok));
+  setTimeout(()=>{ refreshAll(); loadCustomNodes(); }, 2000);
 }
 
 async function refreshAll() {
@@ -1142,16 +1324,34 @@ async function refreshAll() {
       <span class="pill ${enabled?'on':'off'}">${enabled ? '→ 节点槽'+(slot+1) : '直连'}</span>`;
     rb.appendChild(row);
   }
-  // 快速连接节点列表
+  // 快速连接节点列表（VPNGate + 自建）
   const sel = document.getElementById('quickNode');
   const cur = sel.value;
   sel.innerHTML = '<option value="">-- 选择节点 --</option>';
-  (d.nodes||[]).filter(n=>n.probe_status==='available').forEach(n=>{
-    const opt = document.createElement('option');
-    opt.value = n.id;
-    opt.textContent = `${n.country} ${n.ip} ${n.latency_ms?n.latency_ms+'ms':''} ${n.quality||''}`;
-    sel.appendChild(opt);
-  });
+  const vpnNodes = (d.nodes||[]).filter(n=>n.probe_status==='available');
+  if (vpnNodes.length) {
+    const grp1 = document.createElement('optgroup');
+    grp1.label = '── VPNGate 节点 ──';
+    vpnNodes.forEach(n=>{
+      const opt = document.createElement('option');
+      opt.value = 'vpngate:' + n.id;
+      opt.textContent = `${n.country} ${n.ip} ${n.latency_ms?n.latency_ms+'ms':''} ${n.quality||''}`;
+      grp1.appendChild(opt);
+    });
+    sel.appendChild(grp1);
+  }
+  const customD = await api('/api/custom_nodes');
+  if (customD && customD.nodes && customD.nodes.length) {
+    const grp2 = document.createElement('optgroup');
+    grp2.label = '── 自建节点 ──';
+    customD.nodes.forEach(n=>{
+      const opt = document.createElement('option');
+      opt.value = 'custom:' + n.id;
+      opt.textContent = `🔧 ${n.name} (${n.host}:${n.port}) ${n.note||''}`;
+      grp2.appendChild(opt);
+    });
+    sel.appendChild(grp2);
+  }
   if (cur) sel.value = cur;
 }
 
@@ -1288,12 +1488,20 @@ async function saveRouting() {
 }
 
 async function quickConnect() {
-  const nodeId = document.getElementById('quickNode').value;
+  const raw = document.getElementById('quickNode').value;
   const slot = parseInt(document.getElementById('quickSlot').value);
-  if (!nodeId) return showToast('请选择节点', true);
-  showToast(`正在连接 Slot${slot+1}...`);
-  const r = await api('/api/connect', {method:'POST', body:JSON.stringify({node_id:nodeId, slot_id:slot})});
-  showToast(r&&r.ok ? r.message : (r&&r.error)||'连接失败', !(r&&r.ok));
+  if (!raw) return showToast('请选择节点', true);
+  if (raw.startsWith('custom:')) {
+    const nodeId = raw.replace('custom:', '');
+    showToast(`正在连接自建节点到槽${slot+1}...`);
+    const r = await api('/api/connect_custom', {method:'POST', body:JSON.stringify({node_id:nodeId, slot_id:slot})});
+    showToast(r&&r.ok ? r.message : (r&&r.error)||'连接失败', !(r&&r.ok));
+  } else {
+    const nodeId = raw.replace('vpngate:', '');
+    showToast(`正在连接 Slot${slot+1}...`);
+    const r = await api('/api/connect', {method:'POST', body:JSON.stringify({node_id:nodeId, slot_id:slot})});
+    showToast(r&&r.ok ? r.message : (r&&r.error)||'连接失败', !(r&&r.ok));
+  }
   setTimeout(refreshAll, 2000);
 }
 
@@ -1412,6 +1620,8 @@ class WebHandler(BaseHTTPRequestHandler):
         elif path == "/api/nodes":
             nodes = read_json(NODES_FILE, [])
             self._send_json({"nodes": nodes})
+        elif path == "/api/custom_nodes":
+            self._send_json({"nodes": read_json(CUSTOM_NODES_FILE, [])})
         elif path == "/api/filter":
             self._send_json(load_filter())
         elif path == "/api/routing":
@@ -1443,8 +1653,12 @@ class WebHandler(BaseHTTPRequestHandler):
 
         if path == "/api/connect":
             self._handle_connect(body)
+        elif path == "/api/connect_custom":
+            self._handle_connect_custom(body)
         elif path == "/api/stop":
             self._handle_stop(body)
+        elif path == "/api/custom_nodes":
+            self._handle_custom_nodes(body)
         elif path == "/api/fetch_nodes":
             self._handle_fetch_nodes()
         elif path == "/api/test_nodes":
@@ -1503,6 +1717,59 @@ class WebHandler(BaseHTTPRequestHandler):
         slot_id = int(body.get("slot_id", 0))
         stop_slot(slot_id)
         self._send_json({"ok": True})
+
+    def _handle_custom_nodes(self, body: dict):
+        action = body.get("action", "")
+        if action == "add":
+            name = body.get("name", "").strip()
+            host = body.get("host", "").strip()
+            port = int(body.get("port", 0))
+            if not name or not host or not port:
+                self._send_json({"error": "名称、地址、端口为必填项"}, 400)
+                return
+            import uuid as _uuid
+            node_id = "custom_" + _uuid.uuid4().hex[:8]
+            node = {
+                "id": node_id,
+                "node_type": "socks5",
+                "name": name,
+                "host": host,
+                "port": port,
+                "username": body.get("username", ""),
+                "password": body.get("password", ""),
+                "note": body.get("note", ""),
+                "latency_ms": 0,
+                "active_slot": -1,
+                "created_at": time.time(),
+            }
+            nodes = read_json(CUSTOM_NODES_FILE, [])
+            nodes.append(node)
+            write_json(CUSTOM_NODES_FILE, nodes)
+            log("INFO", "CustomNode", f"添加自建节点: {name} ({host}:{port})")
+            self._send_json({"ok": True, "node_id": node_id})
+        elif action == "delete":
+            node_id = body.get("node_id", "")
+            nodes = [n for n in read_json(CUSTOM_NODES_FILE, []) if n["id"] != node_id]
+            write_json(CUSTOM_NODES_FILE, nodes)
+            self._send_json({"ok": True})
+        else:
+            self._send_json({"error": "未知 action"}, 400)
+
+    def _handle_connect_custom(self, body: dict):
+        node_id = body.get("node_id", "")
+        slot_id = int(body.get("slot_id", 0))
+        nodes = read_json(CUSTOM_NODES_FILE, [])
+        node = next((n for n in nodes if n["id"] == node_id), None)
+        if not node:
+            self._send_json({"error": "节点不存在"}, 404)
+            return
+        def do_connect():
+            try:
+                connect_custom_socks5(slot_id, node)
+            except Exception as e:
+                log("ERROR", "API", f"connect_custom error: {e}")
+        threading.Thread(target=do_connect, daemon=True).start()
+        self._send_json({"ok": True, "message": f"正在连接 {node['name']} → 槽{slot_id+1}"})
 
     def _handle_fetch_nodes(self):
         def do_fetch():
