@@ -1,0 +1,29 @@
+# 数据目录（不提交到仓库）
+vpngate_data/
+/var/lib/vpngate-pro/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# 临时文件
+*.tmp
+*.bak
+*.swp
+.DS_Store
+
+# 敏感配置（如果本地调试时放在项目目录）
+ui_auth.json
+vpngate_auth.txt
+nodes.json
+state.json
+routing.json
+filter.json
+configs/
+logs/
