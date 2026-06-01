@@ -130,35 +130,83 @@ def handle_http(client: socket.socket, first_line: str, fwmark: int,
                 upstream: dict | None = None, src_ip: str = "") -> None:
     conn = None
     try:
-        buf = first_line.encode()
+        # 读完整请求头
+        buf = first_line.encode() + b"\r\n"
         while b"\r\n\r\n" not in buf:
             chunk = client.recv(4096)
             if not chunk:
                 return
             buf += chunk
-        if not first_line.upper().startswith("CONNECT "):
-            client.sendall(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
-            return
-        parts = first_line.split()
-        if len(parts) < 2:
-            client.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-            return
-        host_port = parts[1]
-        host, port = (host_port.rsplit(":", 1) if ":" in host_port else (host_port, "443"))
-        port = int(port)
-        try:
-            if upstream:
-                conn = connect_via_upstream_socks5(
-                    host, port, upstream["host"], upstream["port"],
-                    upstream.get("username", ""), upstream.get("password", ""),
-                )
+
+        method = first_line.split()[0].upper() if first_line.split() else ""
+
+        if method == "CONNECT":
+            # HTTPS 隧道
+            parts = first_line.split()
+            if len(parts) < 2:
+                client.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                return
+            host_port = parts[1]
+            host, port = (host_port.rsplit(":", 1) if ":" in host_port else (host_port, "443"))
+            port = int(port)
+            try:
+                if upstream:
+                    conn = connect_via_upstream_socks5(
+                        host, port, upstream["host"], upstream["port"],
+                        upstream.get("username", ""), upstream.get("password", ""),
+                    )
+                else:
+                    conn = create_marked_connection(host, port, fwmark, src_ip)
+            except Exception as e:
+                client.sendall(f"HTTP/1.1 502 Bad Gateway\r\nX-Error: {e}\r\n\r\n".encode())
+                return
+            client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            relay(client, conn)
+
+        elif method in ("GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH"):
+            # 普通 HTTP 请求转发
+            parts = first_line.split()
+            if len(parts) < 2:
+                client.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                return
+            url = parts[1]
+            # 解析目标 host/port
+            if url.startswith("http://"):
+                url_body = url[7:]
+                slash = url_body.find("/")
+                host_port = url_body[:slash] if slash != -1 else url_body
+                path = url_body[slash:] if slash != -1 else "/"
             else:
-                conn = create_marked_connection(host, port, fwmark, src_ip)
-        except Exception as e:
-            client.sendall(f"HTTP/1.1 502 Bad Gateway\r\nX-Error: {e}\r\n\r\n".encode())
-            return
-        client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        relay(client, conn)
+                # 从 Host 头解析
+                host_line = next(
+                    (l for l in buf.decode(errors="replace").splitlines() if l.lower().startswith("host:")),
+                    ""
+                )
+                host_port = host_line.split(":", 1)[1].strip() if ":" in host_line else ""
+                path = url
+            if ":" in host_port:
+                host, port_str = host_port.rsplit(":", 1)
+                port = int(port_str)
+            else:
+                host, port = host_port, 80
+            try:
+                if upstream:
+                    conn = connect_via_upstream_socks5(
+                        host, port, upstream["host"], upstream["port"],
+                        upstream.get("username", ""), upstream.get("password", ""),
+                    )
+                else:
+                    conn = create_marked_connection(host, port, fwmark, src_ip)
+            except Exception as e:
+                client.sendall(f"HTTP/1.1 502 Bad Gateway\r\nX-Error: {e}\r\n\r\n".encode())
+                return
+            # 重写请求行（去掉绝对路径中的 host 部分）
+            new_first_line = f"{method} {path} HTTP/1.1"
+            rest_headers = buf.split(b"\r\n", 1)[1] if b"\r\n" in buf else b"\r\n\r\n"
+            conn.sendall(new_first_line.encode() + b"\r\n" + rest_headers)
+            relay(client, conn)
+        else:
+            client.sendall(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
     except Exception:
         pass
     finally:
