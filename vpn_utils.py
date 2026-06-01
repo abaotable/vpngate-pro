@@ -6,12 +6,11 @@ import json
 import os
 import re
 import socket
-import subprocess
 import time
 import urllib.request
 from typing import Any
 
-# ── 国家名中文映射（常见国家）──────────────────────────────────────
+# ── 国家名中文映射 ──────────────────────────────────────────────────
 COUNTRY_TRANSLATIONS: dict[str, str] = {
     "Japan": "日本", "United States": "美国", "Korea": "韩国",
     "South Korea": "韩国", "China": "中国", "Taiwan": "台湾",
@@ -36,7 +35,6 @@ COUNTRY_TRANSLATIONS: dict[str, str] = {
 # ── OpenVPN 配置解析 ────────────────────────────────────────────────
 
 def parse_remote(config_text: str, fallback_ip: str = "") -> tuple[str, int, str]:
-    """从 ovpn 配置中解析 remote host, port, proto"""
     host, port, proto = fallback_ip, 1194, "udp"
     for line in config_text.splitlines():
         line = line.strip()
@@ -58,70 +56,104 @@ def parse_remote(config_text: str, fallback_ip: str = "") -> tuple[str, int, str
 
 def is_config_tcp(config_text: str) -> bool:
     for line in config_text.splitlines():
-        line = line.strip().lower()
-        if line.startswith("proto ") and "tcp" in line:
+        if line.strip().lower().startswith("proto ") and "tcp" in line:
             return True
     return False
-
-
-def get_upstream_proxy() -> tuple[str, str, int]:
-    """读取环境变量中的上游代理配置，返回 (type, host, port)"""
-    for var in ("ALL_PROXY", "all_proxy", "HTTPS_PROXY", "HTTP_PROXY"):
-        val = os.environ.get(var, "")
-        if val:
-            m = re.match(r"(socks5?|http)://([^:]+):(\d+)", val)
-            if m:
-                return m.group(1).rstrip("5"), m.group(2), int(m.group(3))
-    return "", "", 0
 
 # ── 延迟测试 ────────────────────────────────────────────────────────
 
 def ping_latency_ms(host: str, port: int, fallback: int = 0, timeout: float = 4.0) -> int:
-    """TCP 连接延迟测试，失败返回 fallback"""
+    """TCP 连接延迟测试，失败返回 fallback（0 表示不可达）"""
     try:
         t0 = time.monotonic()
         sock = socket.create_connection((host, port), timeout=timeout)
-        latency = int((time.monotonic() - t0) * 1000)
+        latency = max(1, int((time.monotonic() - t0) * 1000))
         sock.close()
         return latency
     except Exception:
         return fallback
 
-# ── IP 信息查询 ─────────────────────────────────────────────────────
+# ── IP 信息查询（带重试） ───────────────────────────────────────────
 
-def enrich_ip_info(nodes: list[dict[str, Any]], timeout: float = 6.0) -> None:
-    """批量查询节点 IP 信息（ASN、归属地、住宅/机房类型）"""
+def enrich_ip_info(nodes: list[dict[str, Any]], timeout: float = 8.0) -> None:
+    """
+    批量查询节点 IP 的详细地理位置和类型信息。
+    使用 ip-api.com，免费额度 45次/分钟。
+    结果字段：
+      ip_type  : "residential" | "datacenter" | "unknown"
+      quality  : "住宅IP" | "机房IP" | "未知"
+      location : "城市 省份" (中文，如 "大阪 大阪府")
+      country_zh: 中文国家名
+      as_name  : ISP/组织名称
+      asn      : AS号码字符串
+    """
     for node in nodes:
         ip = node.get("ip") or node.get("remote_host") or ""
         if not ip:
+            _set_unknown(node)
             continue
-        try:
-            url = f"http://ip-api.com/json/{ip}?fields=status,country,countryCode,regionName,city,org,as,hosting"
-            req = urllib.request.Request(url, headers={"User-Agent": "vpngate-pro/1.0"})
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = json.loads(resp.read().decode())
-            if data.get("status") == "success":
-                org = data.get("org", "")
-                asn = data.get("as", "")
-                is_hosting = data.get("hosting", False)
-                node["owner"] = org
-                node["asn"] = asn
-                node["as_name"] = org
-                node["location"] = f"{data.get('city', '')} {data.get('regionName', '')}".strip()
-                node["ip_type"] = "datacenter" if is_hosting else "residential"
-                node["quality"] = "机房IP" if is_hosting else "住宅IP"
-        except Exception:
-            node.setdefault("owner", "")
-            node.setdefault("asn", "")
-            node.setdefault("as_name", "")
-            node.setdefault("location", "")
-            node.setdefault("ip_type", "unknown")
-            node.setdefault("quality", "未知")
+        success = False
+        for attempt in range(2):
+            try:
+                url = (
+                    f"http://ip-api.com/json/{ip}"
+                    f"?fields=status,message,country,countryCode,"
+                    f"regionName,city,org,as,hosting,lat,lon&lang=zh-CN"
+                )
+                req = urllib.request.Request(
+                    url, headers={"User-Agent": "vpngate-pro/1.0"}
+                )
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    data = json.loads(resp.read().decode())
+
+                if data.get("status") != "success":
+                    break
+
+                is_hosting = bool(data.get("hosting", False))
+                org        = data.get("org", "")
+                asn        = data.get("as", "")
+                city       = data.get("city", "")
+                region     = data.get("regionName", "")
+                country_en = data.get("country", "")
+
+                # 优先用 ip-api 返回的中文地名（lang=zh-CN）
+                location_parts = [p for p in [city, region] if p]
+                location = " ".join(location_parts)
+
+                country_zh = COUNTRY_TRANSLATIONS.get(country_en, country_en)
+
+                node["owner"]      = org
+                node["asn"]        = asn
+                node["as_name"]    = org
+                node["location"]   = location          # 城市+省份
+                node["country_zh"] = country_zh        # 中文国家名
+                node["ip_type"]    = "datacenter" if is_hosting else "residential"
+                node["quality"]    = "机房IP" if is_hosting else "住宅IP"
+                node["lat"]        = data.get("lat", 0)
+                node["lon"]        = data.get("lon", 0)
+                success = True
+                break
+            except Exception:
+                if attempt == 0:
+                    time.sleep(1)
+        if not success:
+            _set_unknown(node)
+
+
+def _set_unknown(node: dict[str, Any]) -> None:
+    node.setdefault("owner",      "")
+    node.setdefault("asn",        "")
+    node.setdefault("as_name",    "")
+    node.setdefault("location",   "")
+    node.setdefault("country_zh", "")
+    node.setdefault("ip_type",    "unknown")
+    node.setdefault("quality",    "未知")
+    node.setdefault("lat",        0)
+    node.setdefault("lon",        0)
 
 # ── DNS 修复 ────────────────────────────────────────────────────────
 
 def check_and_fix_dns() -> None:
-    """检测 DNS 是否可用，不可用时写入备用 DNS"""
     try:
         socket.setdefaulttimeout(3)
         socket.getaddrinfo("www.vpngate.net", 443)
