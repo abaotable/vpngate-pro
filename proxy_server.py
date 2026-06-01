@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
 双节点本地代理服务器
-- Slot 0: fwmark=110，监听 :7920，流量经 ip rule 走 tun10
-- Slot 1: fwmark=111，监听 :7921，流量经 ip rule 走 tun11
-- src_ip 绑定 tun 本地 IP，确保包从正确接口发出
-- VPN 断开时路由表为空，连接失败返回 502，不回落物理网卡
+- Slot 0: fwmark=110，监听 :7920，tun_dev=tun10
+- Slot 1: fwmark=111，监听 :7921，tun_dev=tun11
+- 每次连接动态读取 tun 当前 IP 作为源地址，避免节点重连后 IP 变化
+- VPN 断开时路由表无路由，连接立即失败，不回落物理网卡
 """
 from __future__ import annotations
 
+import re
 import select
 import socket
+import subprocess
 import threading
 from typing import Any
 
@@ -24,6 +26,23 @@ def recv_exact(sock: socket.socket, size: int) -> bytes:
             raise ConnectionError("连接意外断开")
         data += chunk
     return data
+
+
+def get_tun_ip(tun_dev: str) -> str:
+    """实时读取 tun 网卡当前本地 IP"""
+    if not tun_dev:
+        return ""
+    try:
+        result = subprocess.run(
+            ["ip", "addr", "show", tun_dev],
+            capture_output=True, text=True, timeout=2
+        )
+        m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", result.stdout)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return ""
 
 
 # ── 上游 SOCKS5 转发（自建节点） ────────────────────────────────────
@@ -73,27 +92,25 @@ def connect_via_upstream_socks5(
         raise
 
 
-# ── fwmark + src_ip 路由连接（VPNGate 节点） ────────────────────────
+# ── fwmark 路由连接（VPNGate 节点） ────────────────────────────────
 
 def create_marked_connection(host: str, port: int, fwmark: int,
-                              src_ip: str = "", timeout: float = 20.0) -> socket.socket:
+                              tun_dev: str = "", timeout: float = 20.0) -> socket.socket:
     """
-    创建带 fwmark 标记的 TCP 连接，绑定 tun 本地 IP 作为源地址。
-    - fwmark → ip rule → 路由表 → tun 出站
-    - src_ip → bind() → 确保源地址为 tun 本地 IP
-    VPN 断开时路由表无路由，立即失败，不回落物理网卡。
+    创建带 fwmark 标记的 TCP 连接。
+    每次调用时动态读取 tun 当前 IP 作为 bind 源地址，
+    避免节点重连后 IP 变化导致 bind 失败。
     """
+    src_ip = get_tun_ip(tun_dev)
     for res in socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM):
         af, socktype, proto, _, sa = res
         sock = socket.socket(af, socktype, proto)
         sock.settimeout(timeout)
-        # 打 fwmark 标记
         try:
             sock.setsockopt(socket.SOL_SOCKET, SO_MARK, fwmark)
         except OSError as e:
             sock.close()
             raise RuntimeError(f"SO_MARK 设置失败（需要root）: {e}") from e
-        # 绑定 tun 本地 IP 作为源地址
         if src_ip:
             try:
                 sock.bind((src_ip, 0))
@@ -103,7 +120,7 @@ def create_marked_connection(host: str, port: int, fwmark: int,
             sock.connect(sa)
         except OSError as e:
             sock.close()
-            raise RuntimeError(f"连接 {host}:{port} 失败（VPN未连接）: {e}") from e
+            raise RuntimeError(f"连接 {host}:{port} 失败: {e}") from e
         return sock
     raise OSError(f"无法解析 {host}:{port}")
 
@@ -124,13 +141,12 @@ def relay(left: socket.socket, right: socket.socket) -> None:
             dst.sendall(data)
 
 
-# ── HTTP CONNECT 处理 ────────────────────────────────────────────────
+# ── HTTP 处理（支持 CONNECT 和普通 GET/POST） ────────────────────────
 
 def handle_http(client: socket.socket, first_line: str, fwmark: int,
-                upstream: dict | None = None, src_ip: str = "") -> None:
+                upstream: dict | None = None, tun_dev: str = "") -> None:
     conn = None
     try:
-        # 读完整请求头
         buf = first_line.encode() + b"\r\n"
         while b"\r\n\r\n" not in buf:
             chunk = client.recv(4096)
@@ -138,11 +154,11 @@ def handle_http(client: socket.socket, first_line: str, fwmark: int,
                 return
             buf += chunk
 
-        method = first_line.split()[0].upper() if first_line.split() else ""
+        parts = first_line.split()
+        method = parts[0].upper() if parts else ""
 
         if method == "CONNECT":
             # HTTPS 隧道
-            parts = first_line.split()
             if len(parts) < 2:
                 client.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
                 return
@@ -150,13 +166,11 @@ def handle_http(client: socket.socket, first_line: str, fwmark: int,
             host, port = (host_port.rsplit(":", 1) if ":" in host_port else (host_port, "443"))
             port = int(port)
             try:
-                if upstream:
-                    conn = connect_via_upstream_socks5(
-                        host, port, upstream["host"], upstream["port"],
-                        upstream.get("username", ""), upstream.get("password", ""),
-                    )
-                else:
-                    conn = create_marked_connection(host, port, fwmark, src_ip)
+                conn = (connect_via_upstream_socks5(
+                            host, port, upstream["host"], upstream["port"],
+                            upstream.get("username", ""), upstream.get("password", ""))
+                        if upstream else
+                        create_marked_connection(host, port, fwmark, tun_dev))
             except Exception as e:
                 client.sendall(f"HTTP/1.1 502 Bad Gateway\r\nX-Error: {e}\r\n\r\n".encode())
                 return
@@ -165,23 +179,18 @@ def handle_http(client: socket.socket, first_line: str, fwmark: int,
 
         elif method in ("GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH"):
             # 普通 HTTP 请求转发
-            parts = first_line.split()
             if len(parts) < 2:
                 client.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
                 return
             url = parts[1]
-            # 解析目标 host/port
             if url.startswith("http://"):
-                url_body = url[7:]
-                slash = url_body.find("/")
-                host_port = url_body[:slash] if slash != -1 else url_body
-                path = url_body[slash:] if slash != -1 else "/"
+                rest = url[7:]
+                slash = rest.find("/")
+                host_port = rest[:slash] if slash != -1 else rest
+                path = rest[slash:] if slash != -1 else "/"
             else:
-                # 从 Host 头解析
-                host_line = next(
-                    (l for l in buf.decode(errors="replace").splitlines() if l.lower().startswith("host:")),
-                    ""
-                )
+                host_line = next((l for l in buf.decode(errors="replace").splitlines()
+                                  if l.lower().startswith("host:")), "")
                 host_port = host_line.split(":", 1)[1].strip() if ":" in host_line else ""
                 path = url
             if ":" in host_port:
@@ -190,20 +199,18 @@ def handle_http(client: socket.socket, first_line: str, fwmark: int,
             else:
                 host, port = host_port, 80
             try:
-                if upstream:
-                    conn = connect_via_upstream_socks5(
-                        host, port, upstream["host"], upstream["port"],
-                        upstream.get("username", ""), upstream.get("password", ""),
-                    )
-                else:
-                    conn = create_marked_connection(host, port, fwmark, src_ip)
+                conn = (connect_via_upstream_socks5(
+                            host, port, upstream["host"], upstream["port"],
+                            upstream.get("username", ""), upstream.get("password", ""))
+                        if upstream else
+                        create_marked_connection(host, port, fwmark, tun_dev))
             except Exception as e:
                 client.sendall(f"HTTP/1.1 502 Bad Gateway\r\nX-Error: {e}\r\n\r\n".encode())
                 return
-            # 重写请求行（去掉绝对路径中的 host 部分）
-            new_first_line = f"{method} {path} HTTP/1.1"
+            # 重写请求行（去掉完整 URL，只保留路径）
+            new_req = f"{method} {path} HTTP/1.1\r\n".encode()
             rest_headers = buf.split(b"\r\n", 1)[1] if b"\r\n" in buf else b"\r\n\r\n"
-            conn.sendall(new_first_line.encode() + b"\r\n" + rest_headers)
+            conn.sendall(new_req + rest_headers)
             relay(client, conn)
         else:
             client.sendall(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
@@ -220,7 +227,7 @@ def handle_http(client: socket.socket, first_line: str, fwmark: int,
 # ── SOCKS5 处理 ──────────────────────────────────────────────────────
 
 def handle_socks5(client: socket.socket, fwmark: int,
-                  upstream: dict | None = None, src_ip: str = "") -> None:
+                  upstream: dict | None = None, tun_dev: str = "") -> None:
     conn = None
     try:
         methods_count = recv_exact(client, 1)[0]
@@ -242,13 +249,11 @@ def handle_socks5(client: socket.socket, fwmark: int,
             return
         port = int.from_bytes(recv_exact(client, 2), "big")
         try:
-            if upstream:
-                conn = connect_via_upstream_socks5(
-                    host, port, upstream["host"], upstream["port"],
-                    upstream.get("username", ""), upstream.get("password", ""),
-                )
-            else:
-                conn = create_marked_connection(host, port, fwmark, src_ip)
+            conn = (connect_via_upstream_socks5(
+                        host, port, upstream["host"], upstream["port"],
+                        upstream.get("username", ""), upstream.get("password", ""))
+                    if upstream else
+                    create_marked_connection(host, port, fwmark, tun_dev))
         except Exception:
             client.sendall(b"\x05\x05\x00\x01" + b"\x00" * 6)
             return
@@ -268,13 +273,13 @@ def handle_socks5(client: socket.socket, fwmark: int,
 
 def handle_client(client: socket.socket, fwmark: int,
                   upstream_socks5: dict | None = None,
-                  src_ip: str = "") -> None:
+                  tun_dev: str = "") -> None:
     try:
         first_byte = client.recv(1)
         if not first_byte:
             return
         if first_byte == b"\x05":
-            handle_socks5(client, fwmark, upstream_socks5, src_ip)
+            handle_socks5(client, fwmark, upstream_socks5, tun_dev)
         else:
             rest = b""
             while b"\n" not in rest:
@@ -283,7 +288,7 @@ def handle_client(client: socket.socket, fwmark: int,
                     return
                 rest += chunk
             first_line = (first_byte + rest).decode(errors="replace").split("\n")[0].strip()
-            handle_http(client, first_line, fwmark, upstream_socks5, src_ip)
+            handle_http(client, first_line, fwmark, upstream_socks5, tun_dev)
     except Exception:
         pass
     finally:
@@ -296,13 +301,14 @@ def handle_client(client: socket.socket, fwmark: int,
 # ── Slot 代理服务器 ──────────────────────────────────────────────────
 
 class SlotProxyServer:
-    def __init__(self, slot_id: int, fwmark: int, listen_host: str, listen_port: int):
+    def __init__(self, slot_id: int, fwmark: int, listen_host: str,
+                 listen_port: int, tun_dev: str = ""):
         self.slot_id     = slot_id
         self.fwmark      = fwmark
         self.listen_host = listen_host
         self.listen_port = listen_port
+        self.tun_dev     = tun_dev          # 每次连接时动态读取该网卡的 IP
         self.upstream_socks5: dict | None = None
-        self.src_ip: str = ""  # tun 本地 IP，连接后由 manager 更新
         self._server: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._running = False
@@ -315,7 +321,8 @@ class SlotProxyServer:
         self._server.listen(256)
         self._thread = threading.Thread(target=self._accept_loop, daemon=True)
         self._thread.start()
-        print(f"[Proxy-Slot{self.slot_id}] 监听 {self.listen_host}:{self.listen_port} fwmark={self.fwmark}", flush=True)
+        print(f"[Proxy-Slot{self.slot_id}] 监听 {self.listen_host}:{self.listen_port} "
+              f"fwmark={self.fwmark} tun={self.tun_dev}", flush=True)
 
     def _accept_loop(self) -> None:
         while self._running:
@@ -324,7 +331,7 @@ class SlotProxyServer:
                 client, _ = self._server.accept()
                 threading.Thread(
                     target=handle_client,
-                    args=(client, self.fwmark, self.upstream_socks5, self.src_ip),
+                    args=(client, self.fwmark, self.upstream_socks5, self.tun_dev),
                     daemon=True,
                 ).start()
             except socket.timeout:
@@ -337,10 +344,6 @@ class SlotProxyServer:
 
     def set_upstream_socks5(self, upstream: dict | None) -> None:
         self.upstream_socks5 = upstream
-
-    def set_src_ip(self, ip: str) -> None:
-        """连接 VPN 后更新 tun 本地 IP"""
-        self.src_ip = ip
 
     def stop(self) -> None:
         self._running = False
@@ -356,8 +359,8 @@ class SlotProxyServer:
 _proxy_slots: dict[int, SlotProxyServer] = {}
 
 SLOT_CONFIG = [
-    {"slot_id": 0, "fwmark": 110, "listen_host": "127.0.0.1", "listen_port": 7920},
-    {"slot_id": 1, "fwmark": 111, "listen_host": "127.0.0.1", "listen_port": 7921},
+    {"slot_id": 0, "fwmark": 110, "listen_host": "127.0.0.1", "listen_port": 7920, "tun_dev": "tun10"},
+    {"slot_id": 1, "fwmark": 111, "listen_host": "127.0.0.1", "listen_port": 7921, "tun_dev": "tun11"},
 ]
 
 
@@ -368,6 +371,7 @@ def start_proxy_servers() -> None:
             srv = SlotProxyServer(
                 slot_id=cfg["slot_id"], fwmark=cfg["fwmark"],
                 listen_host=cfg["listen_host"], listen_port=cfg["listen_port"],
+                tun_dev=cfg["tun_dev"],
             )
             srv.start()
             _proxy_slots[sid] = srv
