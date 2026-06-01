@@ -451,21 +451,26 @@ def _stop_proc(proc: subprocess.Popen | None) -> None:
         proc.kill()
 
 def setup_policy_routing(tun_dev: str, table_id: int) -> None:
+    """配置策略路由：fwmark=table_id 的流量走 tun_dev"""
+    # 清理旧规则
     subprocess.run(["ip", "rule", "del", "table", str(table_id)], capture_output=True)
     subprocess.run(["ip", "route", "flush", "table", str(table_id)], capture_output=True)
     for _ in range(3):
         try:
+            # 路由表：默认从 tun_dev 出站
             subprocess.run(["ip", "route", "add", "default", "dev", tun_dev,
                             "table", str(table_id)], check=True, timeout=3)
-            subprocess.run(["ip", "rule", "add", "oif", tun_dev,
+            # 规则1：fwmark 匹配（代理出站流量打了 mark，走此路由表）
+            subprocess.run(["ip", "rule", "add", "fwmark", str(table_id),
                             "table", str(table_id)], check=True, timeout=3)
-            log("INFO", "Routing", f"策略路由: {tun_dev} → 表{table_id}")
+            log("INFO", "Routing", f"策略路由: fwmark={table_id} → {tun_dev} → 表{table_id}")
             return
         except Exception as e:
-            log("WARNING", "Routing", f"策略路由失败: {e}")
+            log("WARNING", "Routing", f"策略路由设置失败: {e}")
             time.sleep(1)
 
 def cleanup_policy_routing(table_id: int) -> None:
+    subprocess.run(["ip", "rule", "del", "fwmark", str(table_id), "table", str(table_id)], capture_output=True)
     subprocess.run(["ip", "rule", "del", "table", str(table_id)], capture_output=True)
     subprocess.run(["ip", "route", "flush", "table", str(table_id)], capture_output=True)
 
