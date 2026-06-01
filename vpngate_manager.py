@@ -450,20 +450,61 @@ def _stop_proc(proc: subprocess.Popen | None) -> None:
     except subprocess.TimeoutExpired:
         proc.kill()
 
+def get_tun_local_ip(tun_dev: str) -> str:
+    """获取 tun 网卡的本地 IP 地址"""
+    try:
+        result = subprocess.run(
+            ["ip", "addr", "show", tun_dev],
+            capture_output=True, text=True, timeout=3
+        )
+        m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", result.stdout)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return ""
+
+
 def setup_policy_routing(tun_dev: str, table_id: int) -> None:
-    """配置策略路由：fwmark=table_id 的流量走 tun_dev"""
+    """配置策略路由：fwmark=table_id 的流量走 tun_dev，源地址为 tun 本地 IP"""
     # 清理旧规则
+    subprocess.run(["ip", "rule", "del", "fwmark", str(table_id), "table", str(table_id)], capture_output=True)
     subprocess.run(["ip", "rule", "del", "table", str(table_id)], capture_output=True)
     subprocess.run(["ip", "route", "flush", "table", str(table_id)], capture_output=True)
+
+    # 等待 tun 获得 IP（最多5秒）
+    tun_ip = ""
+    for _ in range(10):
+        tun_ip = get_tun_local_ip(tun_dev)
+        if tun_ip:
+            break
+        time.sleep(0.5)
+
+    if not tun_ip:
+        log("WARNING", "Routing", f"无法获取 {tun_dev} 的本地IP，路由可能不正确")
+
     for _ in range(3):
         try:
-            # 路由表：默认从 tun_dev 出站
-            subprocess.run(["ip", "route", "add", "default", "dev", tun_dev,
-                            "table", str(table_id)], check=True, timeout=3)
-            # 规则1：fwmark 匹配（代理出站流量打了 mark，走此路由表）
-            subprocess.run(["ip", "rule", "add", "fwmark", str(table_id),
-                            "table", str(table_id)], check=True, timeout=3)
-            log("INFO", "Routing", f"策略路由: fwmark={table_id} → {tun_dev} → 表{table_id}")
+            # 路由表：默认从 tun_dev 出站，强制使用 tun 的本地 IP 作为源地址
+            if tun_ip:
+                subprocess.run(
+                    ["ip", "route", "add", "default", "dev", tun_dev,
+                     "src", tun_ip, "table", str(table_id)],
+                    check=True, timeout=3
+                )
+            else:
+                subprocess.run(
+                    ["ip", "route", "add", "default", "dev", tun_dev,
+                     "table", str(table_id)],
+                    check=True, timeout=3
+                )
+            # fwmark 规则
+            subprocess.run(
+                ["ip", "rule", "add", "fwmark", str(table_id),
+                 "table", str(table_id)],
+                check=True, timeout=3
+            )
+            log("INFO", "Routing", f"策略路由: fwmark={table_id} → {tun_dev}({tun_ip}) → 表{table_id}")
             return
         except Exception as e:
             log("WARNING", "Routing", f"策略路由设置失败: {e}")
@@ -580,6 +621,7 @@ def stop_slot(slot_id: int) -> None:
     srv = proxy_mod._proxy_slots.get(slot_id)
     if srv:
         srv.set_upstream_socks5(None)
+        srv.set_src_ip("")
     with lock:
         nodes = read_json(NODES_FILE, [])
         for n in nodes:
@@ -622,6 +664,13 @@ def connect_slot(slot_id: int, node_id: str) -> str:
         st.node_type = "vpngate"
         st.status_msg = "配置路由..."
         setup_policy_routing(slot_cfg["tun"], slot_cfg["table"])
+
+        # 把 tun 本地 IP 同步给代理服务器
+        tun_ip = get_tun_local_ip(slot_cfg["tun"])
+        srv = proxy_mod._proxy_slots.get(slot_id)
+        if srv:
+            srv.set_src_ip(tun_ip)
+        log("INFO", f"Slot{slot_id}", f"tun IP: {tun_ip}")
         try:
             lat = vpn_utils.ping_latency_ms(
                 node.get("ip") or node.get("remote_host"),
