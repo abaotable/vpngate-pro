@@ -621,7 +621,6 @@ def stop_slot(slot_id: int) -> None:
     srv = proxy_mod._proxy_slots.get(slot_id)
     if srv:
         srv.set_upstream_socks5(None)
-        srv.set_src_ip("")
     with lock:
         nodes = read_json(NODES_FILE, [])
         for n in nodes:
@@ -664,13 +663,6 @@ def connect_slot(slot_id: int, node_id: str) -> str:
         st.node_type = "vpngate"
         st.status_msg = "配置路由..."
         setup_policy_routing(slot_cfg["tun"], slot_cfg["table"])
-
-        # 把 tun 本地 IP 同步给代理服务器
-        tun_ip = get_tun_local_ip(slot_cfg["tun"])
-        srv = proxy_mod._proxy_slots.get(slot_id)
-        if srv:
-            srv.set_src_ip(tun_ip)
-        log("INFO", f"Slot{slot_id}", f"tun IP: {tun_ip}")
         try:
             lat = vpn_utils.ping_latency_ms(
                 node.get("ip") or node.get("remote_host"),
