@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""工具函数：IP信息查询、延迟测试、DNS修复、OpenVPN配置解析"""
+"""
+工具函数：IP信息批量查询、延迟测试、DNS修复、OpenVPN配置解析
+IP类型判断使用 ip-api.com/batch API，支持 proxy/mobile/hosting 三字段综合判断
+"""
 from __future__ import annotations
 
 import json
@@ -8,6 +11,7 @@ import re
 import socket
 import time
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 # ── 国家名中文映射 ──────────────────────────────────────────────────
@@ -32,8 +36,166 @@ COUNTRY_TRANSLATIONS: dict[str, str] = {
     "Unknown": "未知",
 }
 
-# ── OpenVPN 配置解析 ────────────────────────────────────────────────
+# ── IP 信息缓存 ──────────────────────────────────────────────────────
+_IP_CACHE_FILE = Path(os.environ.get("VPNGATE_DATA_DIR", "vpngate_data")) / "ip_cache.json"
+_ip_cache_lock = __import__("threading").Lock()
 
+def _load_ip_cache() -> dict:
+    try:
+        return json.loads(_IP_CACHE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def _save_ip_cache(cache: dict) -> None:
+    try:
+        _IP_CACHE_FILE.parent.mkdir(exist_ok=True, parents=True)
+        _IP_CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+# ── IP 类型判断 ──────────────────────────────────────────────────────
+def _classify_from_batch(item: dict) -> tuple[str, str]:
+    """
+    根据 ip-api.com batch 返回字段综合判断 IP 类型。
+    字段优先级：mobile > proxy > hosting > residential
+    返回 (ip_type, quality)
+    """
+    if item.get("mobile"):
+        return "residential", "移动网络"
+    if item.get("proxy"):
+        return "proxy", "代理/VPN"
+    if item.get("hosting"):
+        return "datacenter", "机房IP"
+    # hosting=false 时还需要用 org/isp 做二次判断
+    org = (item.get("org") or "").lower()
+    isp = (item.get("isp") or "").lower()
+    # 已知 VPN/机房服务商（hosting 字段有时不准）
+    DC_KEYWORDS = [
+        "softether", "vpngate", "cloud", "hosting", "host ", "server",
+        "datacenter", "data center", "vps", "virtual", "dedicated",
+        "coloc", "cdn", "idc", "amazon", "google", "microsoft", "azure",
+        "alibaba", "tencent", "oracle", "linode", "digitalocean", "vultr",
+        "ovh", "hetzner", "leaseweb", "choopa", "quadranet", "cogent",
+        "hurricane", "ntt ", "sakura", "conoha", "kagoya", "xserver",
+        "ablenet", "gmo internet", "softlayer", "rackspace", "psychz",
+        "backbone", "telecom research", "research institute",
+    ]
+    combined = org + " " + isp
+    for kw in DC_KEYWORDS:
+        if kw in combined:
+            return "datacenter", "机房IP"
+    # 住宅 ISP 特征：org 和 isp 高度相似（去除 corp/inc/ltd 等后缀后匹配）
+    def _normalize(s: str) -> str:
+        return re.sub(r"\b(corporation|corp|inc|ltd|llc|co\.|gmbh|s\.a\.|plc|ab)\b", "", s).strip()
+    org_n = _normalize(org)
+    isp_n = _normalize(isp)
+    if org_n and isp_n and (org_n in isp_n or isp_n in org_n):
+        return "residential", "住宅IP"
+    return "residential", "住宅IP"
+
+# ── 批量查询 IP 信息 ────────────────────────────────────────────────
+def enrich_ip_info(nodes: list[dict[str, Any]], timeout: float = 15.0) -> None:
+    """
+    批量查询节点 IP 的详细地理位置和类型信息。
+    使用 ip-api.com/batch POST 接口，每次最多100个IP。
+    带本地缓存（7天有效期）。
+    """
+    now = time.time()
+    CACHE_TTL = 7 * 24 * 3600
+
+    with _ip_cache_lock:
+        cache = _load_ip_cache()
+
+    # 从缓存填充已知IP
+    ips_to_query: list[str] = []
+    for node in nodes:
+        ip = node.get("ip") or node.get("remote_host") or ""
+        if not ip:
+            _set_unknown(node)
+            continue
+        if ip in cache and now - cache[ip].get("cached_at", 0) < CACHE_TTL:
+            _apply_cache(node, cache[ip])
+        else:
+            if ip not in ips_to_query:
+                ips_to_query.append(ip)
+
+    if not ips_to_query:
+        return
+
+    # 批量查询
+    new_entries: dict[str, dict] = {}
+    chunk_size = 100
+    for i in range(0, len(ips_to_query), chunk_size):
+        chunk = ips_to_query[i:i + chunk_size]
+        payload = json.dumps(chunk).encode("utf-8")
+        req = urllib.request.Request(
+            "http://ip-api.com/batch?lang=zh-CN&fields=status,query,country,countryCode,regionName,city,isp,org,as,asname,proxy,hosting,mobile",
+            data=payload,
+            headers={"Content-Type": "application/json", "User-Agent": "vpngate-pro/1.0"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            for item in data:
+                if item.get("status") != "success":
+                    continue
+                query_ip = item.get("query", "")
+                if not query_ip:
+                    continue
+                ip_type, quality = _classify_from_batch(item)
+                country_en = item.get("country", "")
+                country_zh = COUNTRY_TRANSLATIONS.get(country_en, country_en)
+                loc_parts = [item.get("city", ""), item.get("regionName", "")]
+                location = " ".join(p for p in loc_parts if p)
+                entry = {
+                    "owner":      item.get("org") or item.get("isp") or "",
+                    "asn":        item.get("as") or "",
+                    "as_name":    item.get("asname") or "",
+                    "location":   location,
+                    "country_zh": country_zh,
+                    "ip_type":    ip_type,
+                    "quality":    quality,
+                    "cached_at":  now,
+                }
+                new_entries[query_ip] = entry
+        except Exception as e:
+            print(f"[enrich_ip_info] 批量查询失败: {e}", flush=True)
+
+    # 更新缓存
+    if new_entries:
+        with _ip_cache_lock:
+            cache = _load_ip_cache()
+            cache.update(new_entries)
+            _save_ip_cache(cache)
+
+    # 填充节点
+    for node in nodes:
+        ip = node.get("ip") or node.get("remote_host") or ""
+        if ip in new_entries:
+            _apply_cache(node, new_entries[ip])
+        elif not node.get("ip_type"):
+            _set_unknown(node)
+
+def _apply_cache(node: dict, entry: dict) -> None:
+    node["owner"]      = entry.get("owner", "")
+    node["asn"]        = entry.get("asn", "")
+    node["as_name"]    = entry.get("as_name", "")
+    node["location"]   = entry.get("location", "")
+    node["country_zh"] = entry.get("country_zh", "")
+    node["ip_type"]    = entry.get("ip_type", "unknown")
+    node["quality"]    = entry.get("quality", "未知")
+
+def _set_unknown(node: dict) -> None:
+    node.setdefault("owner",      "")
+    node.setdefault("asn",        "")
+    node.setdefault("as_name",    "")
+    node.setdefault("location",   "")
+    node.setdefault("country_zh", "")
+    node.setdefault("ip_type",    "unknown")
+    node.setdefault("quality",    "未知")
+
+# ── OpenVPN 配置解析 ────────────────────────────────────────────────
 def parse_remote(config_text: str, fallback_ip: str = "") -> tuple[str, int, str]:
     host, port, proto = fallback_ip, 1194, "udp"
     for line in config_text.splitlines():
@@ -53,7 +215,6 @@ def parse_remote(config_text: str, fallback_ip: str = "") -> tuple[str, int, str
                 proto = parts[1].lower().replace("6", "")
     return host, port, proto
 
-
 def is_config_tcp(config_text: str) -> bool:
     for line in config_text.splitlines():
         if line.strip().lower().startswith("proto ") and "tcp" in line:
@@ -61,9 +222,7 @@ def is_config_tcp(config_text: str) -> bool:
     return False
 
 # ── 延迟测试 ────────────────────────────────────────────────────────
-
 def ping_latency_ms(host: str, port: int, fallback: int = 0, timeout: float = 4.0) -> int:
-    """TCP 连接延迟测试，失败返回 fallback（0 表示不可达）"""
     try:
         t0 = time.monotonic()
         sock = socket.create_connection((host, port), timeout=timeout)
@@ -73,150 +232,7 @@ def ping_latency_ms(host: str, port: int, fallback: int = 0, timeout: float = 4.
     except Exception:
         return fallback
 
-# ── IP 信息查询（带重试） ───────────────────────────────────────────
-
-def enrich_ip_info(nodes: list[dict[str, Any]], timeout: float = 8.0) -> None:
-    """
-    批量查询节点 IP 的详细地理位置和类型信息。
-    使用 ip-api.com，免费额度 45次/分钟。
-    IP类型采用多维度综合判断（hosting字段 + org/isp关键词 + isp与org一致性）
-    """
-    for node in nodes:
-        ip = node.get("ip") or node.get("remote_host") or ""
-        if not ip:
-            _set_unknown(node)
-            continue
-        success = False
-        for attempt in range(2):
-            try:
-                # 请求 isp 字段用于和 org 对比
-                url = (
-                    f"http://ip-api.com/json/{ip}"
-                    f"?fields=status,message,country,countryCode,"
-                    f"regionName,city,org,as,isp,hosting,lat,lon&lang=zh-CN"
-                )
-                req = urllib.request.Request(
-                    url, headers={"User-Agent": "vpngate-pro/1.0"}
-                )
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    data = json.loads(resp.read().decode())
-
-                if data.get("status") != "success":
-                    break
-
-                is_hosting = bool(data.get("hosting", False))
-                org        = data.get("org", "")
-                isp        = data.get("isp", "")
-                asn        = data.get("as", "")
-                city       = data.get("city", "")
-                region     = data.get("regionName", "")
-                country_en = data.get("country", "")
-
-                location_parts = [p for p in [city, region] if p]
-                location   = " ".join(location_parts)
-                country_zh = COUNTRY_TRANSLATIONS.get(country_en, country_en)
-
-                # ── 多维度综合判断 IP 类型 ──────────────────────────
-                ip_type = _classify_ip_type(is_hosting, org, isp, asn)
-
-                node["owner"]      = org or isp
-                node["asn"]        = asn
-                node["as_name"]    = org or isp
-                node["isp"]        = isp
-                node["location"]   = location
-                node["country_zh"] = country_zh
-                node["ip_type"]    = ip_type
-                node["quality"]    = "机房IP" if ip_type == "datacenter" else "住宅IP"
-                node["lat"]        = data.get("lat", 0)
-                node["lon"]        = data.get("lon", 0)
-                success = True
-                break
-            except Exception:
-                if attempt == 0:
-                    time.sleep(1)
-        if not success:
-            _set_unknown(node)
-
-
-# 机房/云/VPS 关键词（小写匹配）
-_DATACENTER_KEYWORDS = [
-    "cloud", "hosting", "host", "server", "datacenter", "data center",
-    "vps", "virtual", "dedicated", "coloc", "colo", "cdn", "network",
-    "internet", "idc", "telecom", "backbone", "ix", "exchange",
-    "amazon", "google", "microsoft", "azure", "alibaba", "tencent",
-    "huawei", "oracle", "ibm", "linode", "digitalocean", "vultr",
-    "ovh", "hetzner", "leaseweb", "choopa", "quadranet", "psychz",
-    "cogent", "hurricane", "he.net", "zayo", "level3", "lumen",
-    "ntt", "softbank", "kddi", "iij", "sakura", "conoha",
-    "kagoya", "xserver", "wadax", "ablenet", "gmo", "nuro",
-    "limited", "ltd", "inc", "corp", "llc", "co.", "gmbh", "s.a.",
-    "enterprise", "solution", "system", "technology", "tech",
-    "communication", "telecom", "broadband", "fiber",
-]
-
-# 住宅宽带 ISP 关键词（匹配到则倾向住宅）
-_RESIDENTIAL_KEYWORDS = [
-    "home", "residential", "consumer", "dsl", "adsl", "cable",
-    "fttx", "ftth", "fios", "xfinity", "comcast", "at&t", "verizon",
-    "charter", "spectrum", "t-mobile", "docomo", "au ", "biglobe",
-    "plala", "ocn", "so-net", "nifty", "asahi", "willcom",
-]
-
-
-def _classify_ip_type(is_hosting: bool, org: str, isp: str, asn: str) -> str:
-    """
-    综合多个维度判断 IP 类型：
-    1. ip-api 直接标记 hosting=True → 机房
-    2. org/isp/asn 包含明确机房关键词 → 机房
-    3. org 与 isp 高度一致（住宅 IP 特征） → 住宅
-    4. isp 包含住宅关键词 → 住宅
-    5. 默认 → 机房（VPNGate 节点大多是服务器/机构网络）
-    """
-    org_l = (org or "").lower()
-    isp_l = (isp or "").lower()
-    asn_l = (asn or "").lower()
-    combined = org_l + " " + isp_l + " " + asn_l
-
-    # 规则1：ip-api 直接标记
-    if is_hosting:
-        return "datacenter"
-
-    # 规则2：明确住宅关键词
-    for kw in _RESIDENTIAL_KEYWORDS:
-        if kw in combined:
-            return "residential"
-
-    # 规则3：org 与 isp 高度一致 → 住宅宽带 ISP 特征
-    # 住宅 IP 的 org 和 isp 通常是同一家运营商
-    if org and isp and org_l == isp_l:
-        # 还要排除 org 本身是机房关键词的情况
-        is_dc_org = any(kw in org_l for kw in _DATACENTER_KEYWORDS)
-        if not is_dc_org:
-            return "residential"
-
-    # 规则4：明确机房关键词
-    for kw in _DATACENTER_KEYWORDS:
-        if kw in combined:
-            return "datacenter"
-
-    # 规则5：org 和 isp 都为空或都不匹配 → 默认机房
-    # （VPNGate 志愿者节点多为大学/企业/机构网络）
-    return "datacenter"
-
-
-def _set_unknown(node: dict[str, Any]) -> None:
-    node.setdefault("owner",      "")
-    node.setdefault("asn",        "")
-    node.setdefault("as_name",    "")
-    node.setdefault("location",   "")
-    node.setdefault("country_zh", "")
-    node.setdefault("ip_type",    "unknown")
-    node.setdefault("quality",    "未知")
-    node.setdefault("lat",        0)
-    node.setdefault("lon",        0)
-
 # ── DNS 修复 ────────────────────────────────────────────────────────
-
 def check_and_fix_dns() -> None:
     try:
         socket.setdefaulttimeout(3)
@@ -230,6 +246,6 @@ def check_and_fix_dns() -> None:
         if "8.8.8.8" not in content:
             with open(resolv, "a") as f:
                 f.write("\nnameserver 8.8.8.8\nnameserver 1.1.1.1\n")
-            print("[DNS修复] 已添加备用 DNS 8.8.8.8 / 1.1.1.1", flush=True)
+            print("[DNS修复] 已添加备用 DNS", flush=True)
     except Exception as e:
         print(f"[DNS修复] 失败: {e}", flush=True)
