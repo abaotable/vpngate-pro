@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-双节点本地代理服务器
+双节点本地代理服务器 + 调度代理
 - Slot 0: fwmark=110，监听 :7920，tun_dev=tun10
 - Slot 1: fwmark=111，监听 :7921，tun_dev=tun11
-- 修复：handle_client 一次性读完整请求头再处理，避免数据丢失卡死
-- 每次连接动态读取 tun 当前 IP 作为源地址
+- 调度代理: 监听 :7950，根据配置转发到 直连/槽1/槽2
+  供 xray 使用，每个入站协议可单独配置走哪个槽
 """
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ def get_tun_ip(tun_dev: str) -> str:
     return ""
 
 
-# ── 上游 SOCKS5 转发（自建节点） ────────────────────────────────────
+# ── 上游 SOCKS5 转发 ─────────────────────────────────────────────────
 
 def connect_via_upstream_socks5(
     target_host: str, target_port: int,
@@ -92,10 +92,11 @@ def connect_via_upstream_socks5(
         raise
 
 
-# ── fwmark 路由连接 ──────────────────────────────────────────────────
+# ── fwmark 路由连接（VPNGate 节点） ────────────────────────────────
 
 def create_marked_connection(host: str, port: int, fwmark: int,
                               tun_dev: str = "", timeout: float = 20.0) -> socket.socket:
+    """每次连接时动态读取 tun 当前 IP 作为 bind 源地址"""
     src_ip = get_tun_ip(tun_dev)
     for res in socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM):
         af, socktype, proto, _, sa = res
@@ -115,7 +116,22 @@ def create_marked_connection(host: str, port: int, fwmark: int,
             sock.connect(sa)
         except OSError as e:
             sock.close()
-            raise RuntimeError(f"连接 {host}:{port} 失败: {e}") from e
+            raise RuntimeError(f"连接 {host}:{port} 失败（VPN未连接）: {e}") from e
+        return sock
+    raise OSError(f"无法解析 {host}:{port}")
+
+
+def create_direct_connection(host: str, port: int, timeout: float = 20.0) -> socket.socket:
+    """直连，不走 VPN"""
+    for res in socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM):
+        af, socktype, proto, _, sa = res
+        sock = socket.socket(af, socktype, proto)
+        sock.settimeout(timeout)
+        try:
+            sock.connect(sa)
+        except OSError as e:
+            sock.close()
+            raise RuntimeError(f"直连 {host}:{port} 失败: {e}") from e
         return sock
     raise OSError(f"无法解析 {host}:{port}")
 
@@ -136,13 +152,31 @@ def relay(left: socket.socket, right: socket.socket) -> None:
             dst.sendall(data)
 
 
+# ── 根据模式建立上游连接 ─────────────────────────────────────────────
+
+def make_upstream(host: str, port: int,
+                  mode: str, fwmark: int, tun_dev: str,
+                  custom_upstream: dict | None) -> socket.socket:
+    """
+    mode: "direct" | "slot0" | "slot1"
+    custom_upstream: 自建 SOCKS5 节点配置（仅当 slot 连接的是自建节点时有值）
+    """
+    if mode == "direct":
+        return create_direct_connection(host, port)
+    if custom_upstream:
+        return connect_via_upstream_socks5(
+            host, port,
+            custom_upstream["host"], custom_upstream["port"],
+            custom_upstream.get("username", ""), custom_upstream.get("password", ""),
+        )
+    return create_marked_connection(host, port, fwmark, tun_dev)
+
+
 # ── HTTP 处理 ────────────────────────────────────────────────────────
 
 def handle_http(client: socket.socket, first_line: str, buf: bytes,
-                fwmark: int, upstream: dict | None = None, tun_dev: str = "") -> None:
-    """
-    buf 是已经读完的完整请求头（含 \r\n\r\n），直接使用，不再重复读。
-    """
+                mode: str, fwmark: int, tun_dev: str,
+                custom_upstream: dict | None = None) -> None:
     conn = None
     try:
         parts = first_line.split()
@@ -156,11 +190,7 @@ def handle_http(client: socket.socket, first_line: str, buf: bytes,
             host, port = (host_port.rsplit(":", 1) if ":" in host_port else (host_port, "443"))
             port = int(port)
             try:
-                conn = (connect_via_upstream_socks5(
-                            host, port, upstream["host"], upstream["port"],
-                            upstream.get("username", ""), upstream.get("password", ""))
-                        if upstream else
-                        create_marked_connection(host, port, fwmark, tun_dev))
+                conn = make_upstream(host, port, mode, fwmark, tun_dev, custom_upstream)
             except Exception as e:
                 client.sendall(f"HTTP/1.1 502 Bad Gateway\r\nX-Error: {e}\r\n\r\n".encode())
                 return
@@ -182,21 +212,13 @@ def handle_http(client: socket.socket, first_line: str, buf: bytes,
                                   if l.lower().startswith("host:")), "")
                 host_port = host_line.split(":", 1)[1].strip() if ":" in host_line else ""
                 path = url
-            if ":" in host_port:
-                host, port_str = host_port.rsplit(":", 1)
-                port = int(port_str)
-            else:
-                host, port = host_port, 80
+            host, port = (host_port.rsplit(":", 1) if ":" in host_port else (host_port, 80))
+            port = int(port)
             try:
-                conn = (connect_via_upstream_socks5(
-                            host, port, upstream["host"], upstream["port"],
-                            upstream.get("username", ""), upstream.get("password", ""))
-                        if upstream else
-                        create_marked_connection(host, port, fwmark, tun_dev))
+                conn = make_upstream(host, port, mode, fwmark, tun_dev, custom_upstream)
             except Exception as e:
                 client.sendall(f"HTTP/1.1 502 Bad Gateway\r\nX-Error: {e}\r\n\r\n".encode())
                 return
-            # 重写请求行，其余 headers 原样转发
             new_req = f"{method} {path} HTTP/1.1\r\n".encode()
             rest_headers = b"\r\n".join(buf.split(b"\r\n")[1:])
             conn.sendall(new_req + rest_headers)
@@ -215,8 +237,9 @@ def handle_http(client: socket.socket, first_line: str, buf: bytes,
 
 # ── SOCKS5 处理 ──────────────────────────────────────────────────────
 
-def handle_socks5(client: socket.socket, fwmark: int,
-                  upstream: dict | None = None, tun_dev: str = "") -> None:
+def handle_socks5(client: socket.socket,
+                  mode: str, fwmark: int, tun_dev: str,
+                  custom_upstream: dict | None = None) -> None:
     conn = None
     try:
         methods_count = recv_exact(client, 1)[0]
@@ -238,11 +261,7 @@ def handle_socks5(client: socket.socket, fwmark: int,
             return
         port = int.from_bytes(recv_exact(client, 2), "big")
         try:
-            conn = (connect_via_upstream_socks5(
-                        host, port, upstream["host"], upstream["port"],
-                        upstream.get("username", ""), upstream.get("password", ""))
-                    if upstream else
-                    create_marked_connection(host, port, fwmark, tun_dev))
+            conn = make_upstream(host, port, mode, fwmark, tun_dev, custom_upstream)
         except Exception:
             client.sendall(b"\x05\x05\x00\x01" + b"\x00" * 6)
             return
@@ -258,21 +277,19 @@ def handle_socks5(client: socket.socket, fwmark: int,
                 pass
 
 
-# ── 客户端分发（核心修复：一次性读完整请求头） ───────────────────────
+# ── 客户端分发 ───────────────────────────────────────────────────────
 
-def handle_client(client: socket.socket, fwmark: int,
-                  upstream_socks5: dict | None = None,
-                  tun_dev: str = "") -> None:
+def handle_client(client: socket.socket,
+                  mode: str, fwmark: int, tun_dev: str,
+                  custom_upstream: dict | None = None) -> None:
     try:
         client.settimeout(30)
         first_byte = client.recv(1)
         if not first_byte:
             return
         if first_byte == b"\x05":
-            # SOCKS5
-            handle_socks5(client, fwmark, upstream_socks5, tun_dev)
+            handle_socks5(client, mode, fwmark, tun_dev, custom_upstream)
         else:
-            # HTTP：一次性读完整个请求头（含 \r\n\r\n），不分批
             buf = first_byte
             while b"\r\n\r\n" not in buf:
                 chunk = client.recv(4096)
@@ -280,7 +297,7 @@ def handle_client(client: socket.socket, fwmark: int,
                     break
                 buf += chunk
             first_line = buf.split(b"\r\n")[0].decode(errors="replace").strip()
-            handle_http(client, first_line, buf, fwmark, upstream_socks5, tun_dev)
+            handle_http(client, first_line, buf, mode, fwmark, tun_dev, custom_upstream)
     except Exception:
         pass
     finally:
@@ -323,7 +340,7 @@ class SlotProxyServer:
                 client, _ = self._server.accept()
                 threading.Thread(
                     target=handle_client,
-                    args=(client, self.fwmark, self.upstream_socks5, self.tun_dev),
+                    args=(client, "slot", self.fwmark, self.tun_dev, self.upstream_socks5),
                     daemon=True,
                 ).start()
             except socket.timeout:
@@ -346,9 +363,104 @@ class SlotProxyServer:
                 pass
 
 
+# ── 调度代理（供 xray 使用） ─────────────────────────────────────────
+
+# 每个 xray inbound tag 对应的路由配置
+# 值: "direct" | "slot0" | "slot1"
+_dispatch_routing: dict[str, str] = {}
+_dispatch_lock = threading.Lock()
+
+SLOT_CFG = {
+    "slot0": {"fwmark": 110, "tun_dev": "tun10"},
+    "slot1": {"fwmark": 111, "tun_dev": "tun11"},
+}
+
+
+def set_dispatch_routing(routing: dict[str, str]) -> None:
+    """更新调度路由配置，由 manager 调用"""
+    with _dispatch_lock:
+        _dispatch_routing.clear()
+        _dispatch_routing.update(routing)
+
+
+def get_dispatch_routing() -> dict[str, str]:
+    with _dispatch_lock:
+        return dict(_dispatch_routing)
+
+
+class DispatchProxyServer:
+    """
+    调度代理监听 :7950，根据来源连接决定走哪个槽。
+    由于所有 xray 协议都经过这里，用连接时的 routing 配置决定出口。
+    注意：xray 所有入站都走同一个端口，所以调度以「全局路由」为准，
+    不区分具体协议（协议区分由 xray routing 规则完成）。
+    """
+    def __init__(self, listen_host: str = "127.0.0.1", listen_port: int = 7950):
+        self.listen_host = listen_host
+        self.listen_port = listen_port
+        self.mode = "direct"       # "direct" | "slot0" | "slot1"
+        self._server: socket.socket | None = None
+        self._running = False
+        self._lock = threading.Lock()
+
+    def set_mode(self, mode: str) -> None:
+        """设置全局出口模式"""
+        with self._lock:
+            self.mode = mode
+
+    def get_mode(self) -> str:
+        with self._lock:
+            return self.mode
+
+    def start(self) -> None:
+        self._running = True
+        self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._server.bind((self.listen_host, self.listen_port))
+        self._server.listen(256)
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+        print(f"[DispatchProxy] 调度代理监听 {self.listen_host}:{self.listen_port}", flush=True)
+
+    def _accept_loop(self) -> None:
+        while self._running:
+            try:
+                self._server.settimeout(1.0)
+                client, _ = self._server.accept()
+                mode = self.get_mode()
+                cfg = SLOT_CFG.get(mode, {})
+                fwmark = cfg.get("fwmark", 0)
+                tun_dev = cfg.get("tun_dev", "")
+                # 获取对应槽的自建节点配置
+                custom = None
+                slot_id = 0 if mode == "slot0" else 1 if mode == "slot1" else -1
+                if slot_id >= 0 and slot_id in _proxy_slots:
+                    custom = _proxy_slots[slot_id].upstream_socks5
+                threading.Thread(
+                    target=handle_client,
+                    args=(client, mode, fwmark, tun_dev, custom),
+                    daemon=True,
+                ).start()
+            except socket.timeout:
+                continue
+            except Exception:
+                if self._running:
+                    import traceback
+                    traceback.print_exc()
+                break
+
+    def stop(self) -> None:
+        self._running = False
+        if self._server:
+            try:
+                self._server.close()
+            except Exception:
+                pass
+
+
 # ── 模块级单例 ───────────────────────────────────────────────────────
 
 _proxy_slots: dict[int, SlotProxyServer] = {}
+_dispatch_proxy: DispatchProxyServer | None = None
 
 SLOT_CONFIG = [
     {"slot_id": 0, "fwmark": 110, "listen_host": "127.0.0.1", "listen_port": 7920, "tun_dev": "tun10"},
@@ -357,6 +469,7 @@ SLOT_CONFIG = [
 
 
 def start_proxy_servers() -> None:
+    global _dispatch_proxy
     for cfg in SLOT_CONFIG:
         sid = cfg["slot_id"]
         if sid not in _proxy_slots:
@@ -367,9 +480,16 @@ def start_proxy_servers() -> None:
             )
             srv.start()
             _proxy_slots[sid] = srv
+    if _dispatch_proxy is None:
+        _dispatch_proxy = DispatchProxyServer()
+        _dispatch_proxy.start()
 
 
 def stop_proxy_servers() -> None:
+    global _dispatch_proxy
     for srv in _proxy_slots.values():
         srv.stop()
     _proxy_slots.clear()
+    if _dispatch_proxy:
+        _dispatch_proxy.stop()
+        _dispatch_proxy = None
