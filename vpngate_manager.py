@@ -58,6 +58,9 @@ MAX_SCAN_ROWS      = 300
 MAX_CONCURRENT_TESTS = 6
 OPENVPN_TIMEOUT    = 35
 
+XRAY_CONFIG_FILE   = Path("/root/agsbx/xr.json")
+DISPATCH_CONFIG_FILE = DATA_DIR / "dispatch.json"  # xray各协议调度配置
+
 SLOTS = [
     {"id": 0, "tun": "tun10", "table": 110, "proxy_port": 7920},
     {"id": 1, "tun": "tun11", "table": 111, "proxy_port": 7921},
@@ -515,6 +518,108 @@ def cleanup_policy_routing(table_id: int) -> None:
     subprocess.run(["ip", "rule", "del", "table", str(table_id)], capture_output=True)
     subprocess.run(["ip", "route", "flush", "table", str(table_id)], capture_output=True)
 
+# ── xray 调度配置 ────────────────────────────────────────────────────
+# 调度配置：每个 xray inbound tag 对应出口槽
+# 值: "direct" | "slot0" | "slot1"
+DEFAULT_DISPATCH = {
+    "reality-vision": "direct",
+    "vmess-xr":       "direct",
+    "socks5-xr":      "direct",
+}
+
+def load_dispatch_config() -> dict[str, str]:
+    data = read_json(DISPATCH_CONFIG_FILE, {})
+    result = dict(DEFAULT_DISPATCH)
+    result.update(data)
+    return result
+
+def save_dispatch_config(cfg: dict[str, str]) -> None:
+    write_json(DISPATCH_CONFIG_FILE, cfg)
+
+def apply_dispatch_config(cfg: dict[str, str]) -> None:
+    """
+    根据调度配置修改 xray 的 outbound 并重载 xray。
+    如果所有协议都是 direct，则把 xray 恢复为纯 freedom outbound。
+    否则给 xray 添加 SOCKS5 outbound 指向调度代理 :7950。
+    """
+    needs_proxy = any(v != "direct" for v in cfg.values())
+
+    if not XRAY_CONFIG_FILE.exists():
+        log("WARNING", "xray", f"xray 配置文件不存在: {XRAY_CONFIG_FILE}")
+        return
+
+    try:
+        xray_cfg = json.loads(XRAY_CONFIG_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        log("ERROR", "xray", f"读取 xray 配置失败: {e}")
+        return
+
+    outbounds = xray_cfg.get("outbounds", [])
+
+    # 移除旧的 vpngate-proxy outbound
+    outbounds = [o for o in outbounds if o.get("tag") != "vpngate-proxy"]
+
+    if needs_proxy:
+        # 添加 SOCKS5 outbound 指向调度代理
+        outbounds.append({
+            "tag": "vpngate-proxy",
+            "protocol": "socks",
+            "settings": {
+                "servers": [{"address": "127.0.0.1", "port": 7950}]
+            }
+        })
+
+    xray_cfg["outbounds"] = outbounds
+
+    # 更新路由规则：把指定 inbound tag 的流量路由到 vpngate-proxy
+    routing = xray_cfg.get("routing", {})
+    rules = routing.get("rules", [])
+
+    # 移除旧的 vpngate 路由规则
+    rules = [r for r in rules if r.get("outboundTag") not in ("vpngate-proxy",)
+             or not r.get("inboundTag")]
+
+    if needs_proxy:
+        # 找出需要走代理的 inbound tags
+        proxy_tags = [tag for tag, slot in cfg.items() if slot != "direct"]
+        if proxy_tags:
+            rules.insert(0, {
+                "type": "field",
+                "inboundTag": proxy_tags,
+                "outboundTag": "vpngate-proxy",
+            })
+
+    routing["rules"] = rules
+    xray_cfg["routing"] = routing
+
+    try:
+        XRAY_CONFIG_FILE.write_text(
+            json.dumps(xray_cfg, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception as e:
+        log("ERROR", "xray", f"写入 xray 配置失败: {e}")
+        return
+
+    # 热重载 xray（发送 SIGHUP）
+    try:
+        result = subprocess.run(
+            ["pkill", "-SIGHUP", "-f", "xray run"],
+            capture_output=True, timeout=5
+        )
+        log("INFO", "xray", "已发送 SIGHUP 热重载 xray 配置")
+    except Exception as e:
+        log("WARNING", "xray", f"xray 热重载失败: {e}")
+
+    # 同步更新调度代理的模式
+    # 取所有非 direct 槽中第一个作为调度代理的全局模式
+    # （调度代理统一模式，由 xray routing 规则区分哪些 inbound 走代理）
+    dispatch_srv = proxy_mod._dispatch_proxy
+    if dispatch_srv:
+        active_slots = [v for v in cfg.values() if v != "direct"]
+        mode = active_slots[0] if active_slots else "direct"
+        dispatch_srv.set_mode(mode)
+        log("INFO", "Dispatch", f"调度代理模式: {mode}")
+
 def kill_slot_openvpn(tun_dev: str) -> None:
     subprocess.run(["pkill", "-f", f"openvpn.*{tun_dev}"], capture_output=True)
 
@@ -831,17 +936,77 @@ def auto_switch_slot(slot_id: int) -> None:
     except Exception as e:
         log("ERROR", f"Slot{slot_id}", f"自动切换失败: {e}")
 
+def _verify_slot_tunnel(slot_id: int) -> bool:
+    """实际走代理发 HTTP 请求验证隧道是否通畅"""
+    proxy_port = SLOTS[slot_id]["proxy_port"]
+    try:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({
+                "http": f"http://127.0.0.1:{proxy_port}",
+            })
+        )
+        opener.open("http://connectivitycheck.gstatic.com/generate_204", timeout=10)
+        return True
+    except Exception:
+        pass
+    # 备用检测目标
+    try:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({
+                "http": f"http://127.0.0.1:{proxy_port}",
+            })
+        )
+        with opener.open("http://208.95.112.1/json/?fields=query", timeout=10) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
 # ── 健康监控 ─────────────────────────────────────────────────────────
 def health_monitor() -> None:
+    """
+    每30秒检查一次，双重验证：
+    1. OpenVPN 进程是否存活
+    2. 实际走代理发请求验证隧道是否通畅
+    任一失败则触发自动切换
+    """
+    # 每个槽的连续失败计数，避免单次抖动误触发
+    fail_counts = {0: 0, 1: 0}
+    FAIL_THRESHOLD = 2  # 连续2次失败才切换
+
     while True:
         time.sleep(30)
         for slot_id in range(2):
             st = slot_states[slot_id]
             if not st.node_id or st.is_connecting:
+                fail_counts[slot_id] = 0
                 continue
+
+            failed = False
+
+            # 检查1：进程存活（仅 vpngate 节点）
             if st.node_type == "vpngate":
                 if st.process is None or st.process.poll() is not None:
-                    log("WARNING", f"Slot{slot_id}", "OpenVPN 进程退出，触发自动切换")
+                    log("WARNING", f"Slot{slot_id}", "OpenVPN 进程已退出")
+                    failed = True
+
+            # 检查2：实际走代理验证隧道
+            if not failed:
+                if not _verify_slot_tunnel(slot_id):
+                    log("WARNING", f"Slot{slot_id}", "隧道连通性检测失败")
+                    failed = True
+                else:
+                    # 连通正常，更新状态
+                    st.proxy_ok = True
+                    fail_counts[slot_id] = 0
+
+            if failed:
+                fail_counts[slot_id] += 1
+                if fail_counts[slot_id] >= FAIL_THRESHOLD:
+                    log("WARNING", f"Slot{slot_id}",
+                        f"连续 {fail_counts[slot_id]} 次检测失败，触发自动切换")
+                    fail_counts[slot_id] = 0
+                    st.proxy_ok = False
+                    st.status_msg = "连接断开，切换中..."
                     threading.Thread(target=auto_switch_slot, args=(slot_id,), daemon=True).start()
 
 def refresh_nodes_loop() -> None:
@@ -980,6 +1145,7 @@ tr:hover td{background:#141720}
     <div class="tab" onclick="switchTab('nodes')">🗂 节点列表</div>
     <div class="tab" onclick="switchTab('custom')">🔧 自建节点</div>
     <div class="tab" onclick="switchTab('autoswitch')">🔁 自动切换</div>
+    <div class="tab" onclick="switchTab('xray')">🚀 xray出口</div>
     <div class="tab" onclick="switchTab('filter')">🎯 过滤设置</div>
     <div class="tab" onclick="switchTab('routing')">🔀 协议路由</div>
     <div class="tab" onclick="switchTab('logs')">📋 日志</div>
@@ -1040,13 +1206,13 @@ tr:hover td{background:#141720}
         <h2>🗂 节点列表</h2>
         <div class="flex gap-2">
           <button class="btn btn-sm btn-grey" onclick="fetchNodes()">拉取节点</button>
-          <button class="btn btn-sm btn-primary" onclick="testTopNodes()">测试前10个</button>
+          <button class="btn btn-sm btn-primary" onclick="testCurrentPage()">测试当前页</button>
         </div>
       </div>
       <div class="filter-row mt-2">
         <div class="filter-group">
           <label>状态</label>
-          <select class="select" id="flStatus" onchange="renderNodes()">
+          <select class="select" id="flStatus" onchange="gotoPage(1)">
             <option value="">全部</option>
             <option value="available">可用</option>
             <option value="not_checked">未测试</option>
@@ -1055,28 +1221,39 @@ tr:hover td{background:#141720}
         </div>
         <div class="filter-group">
           <label>国家</label>
-          <select class="select" id="flCountry" onchange="renderNodes()">
+          <select class="select" id="flCountry" onchange="gotoPage(1)">
             <option value="">全部</option>
           </select>
         </div>
         <div class="filter-group">
           <label>IP类型</label>
-          <select class="select" id="flIpType" onchange="renderNodes()">
+          <select class="select" id="flIpType" onchange="gotoPage(1)">
             <option value="">全部</option>
             <option value="residential">住宅</option>
             <option value="datacenter">机房</option>
+            <option value="proxy">代理/VPN</option>
+          </select>
+        </div>
+        <div class="filter-group">
+          <label>每页数量</label>
+          <select class="select" id="pageSize" onchange="gotoPage(1)">
+            <option value="20">20</option>
+            <option value="50" selected>50</option>
+            <option value="100">100</option>
+            <option value="200">200</option>
           </select>
         </div>
       </div>
       <div style="overflow-x:auto">
         <table>
           <thead><tr>
-            <th>国家/地区</th><th>IP</th><th>延迟</th><th>IP类型</th>
+            <th>国家/地区</th><th>IP</th><th>协议</th><th>延迟</th><th>IP类型</th>
             <th>状态</th><th>归属/位置</th><th>操作</th>
           </tr></thead>
           <tbody id="nodeTable"></tbody>
         </table>
       </div>
+      <div class="flex items-center gap-2 mt-3" id="pagination" style="justify-content:center"></div>
     </div>
   </div>
 
@@ -1107,6 +1284,25 @@ tr:hover td{background:#141720}
   <div class="content page" id="page-autoswitch">
     <div id="slotSwitchCards"></div>
     <button class="btn btn-primary mt-3" onclick="saveSlotConfigs()">💾 保存自动切换配置</button>
+  </div>
+
+  <!-- xray 出口配置 -->
+  <div class="content page" id="page-xray">
+    <div class="card">
+      <h2>🚀 xray 协议出口配置</h2>
+      <p class="text-xs text-grey" style="margin-bottom:14px">
+        配置 xray 各入站协议的出口方式。选择槽1/槽2后，对应协议流量将通过 VPNGate 节点出站。
+        修改后自动热重载 xray，无需重启。
+      </p>
+      <div id="xrayRoutingCards"></div>
+      <button class="btn btn-primary mt-3" onclick="saveXrayDispatch()">💾 保存并应用</button>
+    </div>
+    <div class="card mt-3">
+      <h2>ℹ️ 当前调度代理状态</h2>
+      <div class="stat"><span class="label">调度代理地址</span><span class="val">127.0.0.1:7950</span></div>
+      <div class="stat"><span class="label">当前模式</span><span class="val" id="dispatchMode">-</span></div>
+      <p class="text-xs text-grey mt-2">xray 所有入站经调度代理 :7950 统一出站，由 xray routing 规则区分哪些协议走 VPN。</p>
+    </div>
   </div>
 
   <!-- 过滤设置 -->
@@ -1185,8 +1381,15 @@ let SESSION = localStorage.getItem('vpn_session') || '';
 let allNodes = [], filterData = {countries:[], ip_types:[], max_latency_ms:0};
 let selectedCountries = new Set(), selectedIpTypes = new Set();
 let slotConfigs = {};
+let currentPage = 1;
+let filteredNodes = [];
 
 const PROTO_PORTS = {'VLESS-Reality':25476,'Shadowsocks':62026,'VMess-WS':6123,'Hysteria2':53145,'SOCKS5':42447};
+const XRAY_TAGS = {
+  'reality-vision': 'VLESS-Reality (:25476)',
+  'vmess-xr':       'VMess-WS (:6123)',
+  'socks5-xr':      'SOCKS5 (:42447)',
+};
 const SOURCE_LABELS = {
   'vpngate_residential':'🏘 VPNGate 住宅IP',
   'vpngate_datacenter':'🏢 VPNGate 机房IP',
@@ -1245,7 +1448,7 @@ function doLogout() {
 }
 
 function switchTab(name) {
-  const pages = ['dashboard','nodes','custom','autoswitch','filter','routing','logs','settings'];
+  const pages = ['dashboard','nodes','custom','autoswitch','xray','filter','routing','logs','settings'];
   document.querySelectorAll('.tab').forEach((t,i)=>{
     t.classList.toggle('active', pages[i]===name);
   });
@@ -1255,6 +1458,7 @@ function switchTab(name) {
   if(name==='nodes') loadNodes();
   if(name==='custom') loadCustomNodes();
   if(name==='autoswitch') loadAutoSwitch();
+  if(name==='xray') loadXrayDispatch();
   if(name==='filter') loadFilter();
   if(name==='routing') loadRouting();
   if(name==='logs') loadLogs();
@@ -1318,7 +1522,7 @@ async function refreshAll() {
   if (cur) sel.value = cur;
 }
 
-// ── 节点列表 ──
+// ── 节点列表（带分页） ──
 async function loadNodes() {
   const d = await api('/api/nodes');
   if (!d) return;
@@ -1329,10 +1533,10 @@ async function loadNodes() {
   const countries = [...new Set(allNodes.map(n=>n.country).filter(Boolean))].sort();
   countries.forEach(c=>{ const o=document.createElement('option'); o.value=c; o.textContent=c; cs.appendChild(o); });
   cs.value = cur;
-  renderNodes();
+  gotoPage(1);
 }
 
-function renderNodes() {
+function getFilteredNodes() {
   const sf = document.getElementById('flStatus').value;
   const cf = document.getElementById('flCountry').value;
   const tf = document.getElementById('flIpType').value;
@@ -1340,25 +1544,39 @@ function renderNodes() {
   if (sf) nodes = nodes.filter(n=>n.probe_status===sf);
   if (cf) nodes = nodes.filter(n=>n.country===cf);
   if (tf) nodes = nodes.filter(n=>n.ip_type===tf);
+  return nodes;
+}
+
+function gotoPage(page) {
+  filteredNodes = getFilteredNodes();
+  const pageSize = parseInt(document.getElementById('pageSize')?.value||'50');
+  const totalPages = Math.max(1, Math.ceil(filteredNodes.length / pageSize));
+  currentPage = Math.max(1, Math.min(page, totalPages));
+  const start = (currentPage-1)*pageSize;
+  const pageNodes = filteredNodes.slice(start, start+pageSize);
+  renderNodePage(pageNodes, totalPages, pageSize);
+}
+
+function renderNodes() { gotoPage(1); }
+
+function renderNodePage(nodes, totalPages, pageSize) {
   const tbody = document.getElementById('nodeTable');
   tbody.innerHTML = '';
-  nodes.slice(0,200).forEach(n=>{
-    const st = n.probe_status;
-    const stTag = st==='available'?'available':st==='unavailable'?'unavail':'notcheck';
-    const stLabel = st==='available'?'可用':st==='unavailable'?'不可用':'未测试';
-    // 地理位置：优先显示 location（城市+省份），然后是国家
+  const IP_TYPE_MAP = {residential:['住宅','residential'],datacenter:['机房','datacenter'],proxy:['代理','unknown'],unknown:['未知','unknown'],mobile:['移动','residential']};
+  const ST_MAP = {available:['可用','available'],unavailable:['不可用','unavail'],not_checked:['未测试','notcheck']};
+  nodes.forEach(n=>{
     const geo = [n.country, n.location].filter(Boolean).join(' · ');
-    // IP类型标签
-    const ipTypeLabel = n.ip_type==='residential'?'住宅':n.ip_type==='datacenter'?'机房':'未知';
-    const ipTypeClass = n.ip_type==='residential'?'residential':n.ip_type==='datacenter'?'datacenter':'unknown';
+    const [itLabel, itClass] = IP_TYPE_MAP[n.ip_type]||['未知','unknown'];
+    const [stLabel, stClass] = ST_MAP[n.probe_status]||['未知','notcheck'];
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td>${geo||'-'} <span style="font-size:10px;color:#4a5568">${n.country_short||''}</span></td>
       <td style="font-family:monospace">${n.ip||'-'}</td>
+      <td style="font-size:11px;color:#718096">${n.proto||'-'}</td>
       <td>${n.latency_ms?n.latency_ms+'ms':'-'}</td>
-      <td><span class="tag ${ipTypeClass}">${ipTypeLabel}</span></td>
-      <td><span class="tag ${stTag}">${stLabel}</span></td>
-      <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:#718096">${n.as_name||n.owner||'-'}</td>
+      <td><span class="tag ${itClass}">${itLabel}</span></td>
+      <td><span class="tag ${stClass}">${stLabel}</span></td>
+      <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:#718096">${n.as_name||n.owner||'-'}</td>
       <td>
         <button class="btn btn-sm btn-primary" onclick="connectNode('${n.id}',0)">→槽1</button>
         <button class="btn btn-sm btn-grey" onclick="connectNode('${n.id}',1)">→槽2</button>
@@ -1366,7 +1584,58 @@ function renderNodes() {
       </td>`;
     tbody.appendChild(tr);
   });
-  if (!nodes.length) tbody.innerHTML='<tr><td colspan="7" style="text-align:center;padding:20px;color:#718096">无节点数据</td></tr>';
+  if (!nodes.length) tbody.innerHTML='<tr><td colspan="8" style="text-align:center;padding:20px;color:#718096">无节点数据</td></tr>';
+
+  // 分页控件
+  const pg = document.getElementById('pagination');
+  pg.innerHTML = '';
+  const info = document.createElement('span');
+  info.className = 'text-xs text-grey';
+  info.textContent = `共 ${filteredNodes.length} 个节点，第 ${currentPage}/${totalPages} 页`;
+  pg.appendChild(info);
+
+  const btnStyle = 'padding:4px 10px;border-radius:4px;border:1px solid #2d3748;background:#141720;color:#a0aec0;cursor:pointer;font-size:12px;margin:0 2px';
+  const activeBtnStyle = btnStyle + ';background:#2b4c7e;border-color:#63b3ed;color:#90cdf4';
+
+  if (totalPages > 1) {
+    const prev = document.createElement('button');
+    prev.textContent = '‹';
+    prev.style.cssText = btnStyle;
+    prev.disabled = currentPage === 1;
+    prev.onclick = () => gotoPage(currentPage-1);
+    pg.appendChild(prev);
+
+    // 显示页码按钮（最多显示7个）
+    let start = Math.max(1, currentPage-3);
+    let end = Math.min(totalPages, start+6);
+    start = Math.max(1, end-6);
+    for (let i=start; i<=end; i++) {
+      const btn = document.createElement('button');
+      btn.textContent = i;
+      btn.style.cssText = i===currentPage ? activeBtnStyle : btnStyle;
+      btn.onclick = (()=>{const p=i; return ()=>gotoPage(p)})();
+      pg.appendChild(btn);
+    }
+
+    const next = document.createElement('button');
+    next.textContent = '›';
+    next.style.cssText = btnStyle;
+    next.disabled = currentPage === totalPages;
+    next.onclick = () => gotoPage(currentPage+1);
+    pg.appendChild(next);
+  }
+}
+
+async function testCurrentPage() {
+  // 获取当前页的节点ID
+  const pageSize = parseInt(document.getElementById('pageSize')?.value||'50');
+  const start = (currentPage-1)*pageSize;
+  const pageNodes = filteredNodes.slice(start, start+pageSize);
+  const ids = pageNodes.map(n=>n.id);
+  if (!ids.length) return showToast('当前页无节点', true);
+  showToast(`后台测试当前页 ${ids.length} 个节点...`);
+  const r = await api('/api/test_nodes', {method:'POST', body:JSON.stringify({node_ids:ids})});
+  showToast(r&&r.ok?`已开始测试 ${r.count} 个节点，稍后刷新查看`:'失败', !(r&&r.ok));
 }
 
 // ── 自建节点 ──
@@ -1661,6 +1930,41 @@ async function testTopNodes() {
   showToast(r&&r.ok?'测试已在后台运行，稍后刷新查看结果':'失败', !(r&&r.ok));
 }
 
+// ── xray 出口调度 ──
+async function loadXrayDispatch() {
+  const r = await api('/api/dispatch');
+  if (!r) return;
+  const cfg = r.config||{};
+  const mode = r.mode||'direct';
+  document.getElementById('dispatchMode').textContent = mode==='direct'?'直连':mode==='slot0'?'槽1':'槽2';
+  const wrap = document.getElementById('xrayRoutingCards');
+  wrap.innerHTML = '';
+  for (const [tag, label] of Object.entries(XRAY_TAGS)) {
+    const cur = cfg[tag]||'direct';
+    const div = document.createElement('div');
+    div.className = 'proto-row';
+    div.innerHTML = `
+      <span class="proto-name" style="width:200px">${label}</span>
+      <select class="select" id="xray-${tag}" style="width:160px">
+        <option value="direct" ${cur==='direct'?'selected':''}>直连（VPS原IP）</option>
+        <option value="slot0" ${cur==='slot0'?'selected':''}>槽1（VPNGate）</option>
+        <option value="slot1" ${cur==='slot1'?'selected':''}>槽2（VPNGate）</option>
+      </select>`;
+    wrap.appendChild(div);
+  }
+}
+
+async function saveXrayDispatch() {
+  const cfg = {};
+  for (const tag of Object.keys(XRAY_TAGS)) {
+    const el = document.getElementById(`xray-${tag}`);
+    if (el) cfg[tag] = el.value;
+  }
+  const r = await api('/api/dispatch', {method:'POST', body:JSON.stringify({config:cfg})});
+  showToast(r&&r.ok?'已保存并热重载 xray':'保存失败', !(r&&r.ok));
+  if (r&&r.ok) loadXrayDispatch();
+}
+
 async function testOneNode(nodeId, btn) {
   const orig = btn.textContent;
   btn.textContent = '测试中...';
@@ -1788,6 +2092,10 @@ class WebHandler(BaseHTTPRequestHandler):
         elif path == "/api/ui_config":
             cfg = load_ui_config()
             self._send_json({"port": cfg.get("port", 8787)})
+        elif path == "/api/dispatch":
+            cfg = load_dispatch_config()
+            mode = proxy_mod._dispatch_proxy.get_mode() if proxy_mod._dispatch_proxy else "direct"
+            self._send_json({"config": cfg, "mode": mode})
         elif path == "/api/logs":         self._handle_logs()
         else:                             self._send_json({"error": "not found"}, 404)
 
@@ -1824,6 +2132,11 @@ class WebHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": True})
         elif path == "/api/slot_configs":
             save_slot_configs(body.get("configs", {}))
+            self._send_json({"ok": True})
+        elif path == "/api/dispatch":
+            cfg = body.get("config", {})
+            save_dispatch_config(cfg)
+            threading.Thread(target=apply_dispatch_config, args=(cfg,), daemon=True).start()
             self._send_json({"ok": True})
         elif path == "/api/update_credentials": self._handle_update_credentials(body)
         else:                                   self._send_json({"error": "not found"}, 404)
@@ -1905,9 +2218,14 @@ class WebHandler(BaseHTTPRequestHandler):
         self._send_json({"ok": True, "count": count})
 
     def _handle_test_nodes(self, body: dict):
-        count = int(body.get("count", 10))
-        nodes = read_json(NODES_FILE, [])
-        ids = [n["id"] for n in nodes if n.get("probe_status") == "not_checked"][:count]
+        # 支持两种方式：传 node_ids 列表，或传 count 取前N个未测试节点
+        node_ids = body.get("node_ids")
+        if node_ids:
+            ids = node_ids
+        else:
+            count = int(body.get("count", 10))
+            nodes = read_json(NODES_FILE, [])
+            ids = [n["id"] for n in nodes if n.get("probe_status") == "not_checked"][:count]
         threading.Thread(target=batch_test_nodes, args=(ids,), daemon=True).start()
         self._send_json({"ok": True, "count": len(ids)})
 
@@ -2018,6 +2336,11 @@ def main():
     log("INFO", "Main", "VPNGate Pro 启动")
 
     proxy_mod.start_proxy_servers()
+
+    # 启动时恢复调度配置
+    dispatch_cfg = load_dispatch_config()
+    if any(v != "direct" for v in dispatch_cfg.values()):
+        threading.Thread(target=apply_dispatch_config, args=(dispatch_cfg,), daemon=True).start()
 
     def startup_fetch():
         try:
