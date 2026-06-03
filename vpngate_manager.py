@@ -28,7 +28,49 @@ SLOT_CONFIG_FILE  = DATA_DIR / "slot_config.json"
 XRAY_DISPATCH_FILE= DATA_DIR / "xray_dispatch.json"
 AUTH_FILE         = DATA_DIR / "vpngate_auth.txt"
 LOGS_DIR          = DATA_DIR / "logs"
-XRAY_CONFIG_FILE  = Path("/root/agsbx/xr.json")
+XRAY_BIN        = Path("/root/agsbx/xray")
+XRAY_CFG        = Path("/root/agsbx/xr.json")
+XRAY_LOG        = Path("/root/agsbx/xray.log")
+XRAY_CONFIG_FILE = XRAY_CFG   # 兼容旧引用
+
+def _restart_xray() -> bool:
+    """强制杀死并重启 xray 进程，返回是否成功"""
+    # 先尝试优雅退出，再强制kill
+    subprocess.run(["pkill", "-f", "xray run"], capture_output=True)
+    time.sleep(1)
+    subprocess.run(["pkill", "-9", "-f", "xray run"], capture_output=True)
+    time.sleep(1)
+    if not XRAY_BIN.exists():
+        log("ERROR", "xray", f"xray 可执行文件不存在: {XRAY_BIN}")
+        return False
+    try:
+        log_file = open(XRAY_LOG, "a")
+        proc = subprocess.Popen(
+            [str(XRAY_BIN), "run", "-c", str(XRAY_CFG)],
+            stdout=log_file, stderr=log_file,
+            start_new_session=True,
+        )
+        time.sleep(2)
+        if proc.poll() is None:
+            log("INFO", "xray", f"xray 重启成功，PID={proc.pid}")
+            return True
+        else:
+            log("ERROR", "xray", "xray 启动后立即退出")
+            return False
+    except Exception as e:
+        log("ERROR", "xray", f"xray 启动失败: {e}")
+        return False
+
+def xray_watchdog() -> None:
+    """守护线程：每30秒检查 xray 是否在运行，崩溃则自动重启"""
+    time.sleep(15)  # 启动后等15秒再开始监控
+    while True:
+        time.sleep(30)
+        result = subprocess.run(["pgrep", "-f", "xray run"],
+                                capture_output=True, text=True)
+        if not result.stdout.strip():
+            log("WARNING", "xray", "xray 进程不存在，自动重启...")
+            _restart_xray()
 
 OPENVPN_CMD       = os.environ.get("OPENVPN_CMD", "openvpn")
 MAX_SCAN_ROWS     = 300
@@ -157,18 +199,17 @@ def apply_xray_dispatch(cfg: dict[str, str]) -> None:
     xray_cfg["routing"] = routing
 
     try:
-        XRAY_CONFIG_FILE.write_text(
+        XRAY_CFG.write_text(
             json.dumps(xray_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as e:
         log("ERROR", "xray", f"写入配置失败: {e}")
         return
 
-    try:
-        subprocess.run(["pkill", "-SIGHUP", "-f", "xray run"],
-                       capture_output=True, timeout=5)
-        log("INFO", "xray", "热重载成功")
-    except Exception as e:
-        log("WARNING", "xray", f"热重载失败: {e}")
+    # SIGHUP 在 argosbx 环境下无效，直接强制重启
+    if _restart_xray():
+        log("INFO", "xray", "配置已应用，xray 重启成功")
+    else:
+        log("ERROR", "xray", "xray 重启失败，请手动检查")
 
 # ── 辅助函数 ─────────────────────────────────────────────────────────
 def ensure_dirs() -> None:
@@ -1968,6 +2009,7 @@ def main():
     threading.Thread(target=startup_fetch, daemon=True).start()
     threading.Thread(target=health_monitor, daemon=True).start()
     threading.Thread(target=refresh_nodes_loop, daemon=True).start()
+    threading.Thread(target=xray_watchdog, daemon=True).start()
 
     cfg  = load_ui_config()
     host = cfg.get("host", "0.0.0.0")
