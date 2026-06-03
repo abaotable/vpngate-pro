@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 工具函数：IP信息批量查询、延迟测试、DNS修复、OpenVPN配置解析
-IP类型判断使用 ip-api.com/batch API，支持 proxy/mobile/hosting 三字段综合判断
 """
 from __future__ import annotations
 
@@ -9,12 +8,12 @@ import json
 import os
 import re
 import socket
+import subprocess
 import time
 import urllib.request
 from pathlib import Path
 from typing import Any
 
-# ── 国家名中文映射 ──────────────────────────────────────────────────
 COUNTRY_TRANSLATIONS: dict[str, str] = {
     "Japan": "日本", "United States": "美国", "Korea": "韩国",
     "South Korea": "韩国", "China": "中国", "Taiwan": "台湾",
@@ -36,7 +35,6 @@ COUNTRY_TRANSLATIONS: dict[str, str] = {
     "Unknown": "未知",
 }
 
-# ── IP 信息缓存 ──────────────────────────────────────────────────────
 _IP_CACHE_FILE = Path(os.environ.get("VPNGATE_DATA_DIR", "vpngate_data")) / "ip_cache.json"
 _ip_cache_lock = __import__("threading").Lock()
 
@@ -53,23 +51,15 @@ def _save_ip_cache(cache: dict) -> None:
     except Exception:
         pass
 
-# ── IP 类型判断 ──────────────────────────────────────────────────────
 def _classify_from_batch(item: dict) -> tuple[str, str]:
-    """
-    根据 ip-api.com batch 返回字段综合判断 IP 类型。
-    字段优先级：mobile > proxy > hosting > residential
-    返回 (ip_type, quality)
-    """
     if item.get("mobile"):
         return "residential", "移动网络"
     if item.get("proxy"):
         return "proxy", "代理/VPN"
     if item.get("hosting"):
         return "datacenter", "机房IP"
-    # hosting=false 时还需要用 org/isp 做二次判断
     org = (item.get("org") or "").lower()
     isp = (item.get("isp") or "").lower()
-    # 已知 VPN/机房服务商（hosting 字段有时不准）
     DC_KEYWORDS = [
         "softether", "vpngate", "cloud", "hosting", "host ", "server",
         "datacenter", "data center", "vps", "virtual", "dedicated",
@@ -84,7 +74,6 @@ def _classify_from_batch(item: dict) -> tuple[str, str]:
     for kw in DC_KEYWORDS:
         if kw in combined:
             return "datacenter", "机房IP"
-    # 住宅 ISP 特征：org 和 isp 高度相似（去除 corp/inc/ltd 等后缀后匹配）
     def _normalize(s: str) -> str:
         return re.sub(r"\b(corporation|corp|inc|ltd|llc|co\.|gmbh|s\.a\.|plc|ab)\b", "", s).strip()
     org_n = _normalize(org)
@@ -93,20 +82,11 @@ def _classify_from_batch(item: dict) -> tuple[str, str]:
         return "residential", "住宅IP"
     return "residential", "住宅IP"
 
-# ── 批量查询 IP 信息 ────────────────────────────────────────────────
 def enrich_ip_info(nodes: list[dict[str, Any]], timeout: float = 15.0) -> None:
-    """
-    批量查询节点 IP 的详细地理位置和类型信息。
-    使用 ip-api.com/batch POST 接口，每次最多100个IP。
-    带本地缓存（7天有效期）。
-    """
     now = time.time()
     CACHE_TTL = 7 * 24 * 3600
-
     with _ip_cache_lock:
         cache = _load_ip_cache()
-
-    # 从缓存填充已知IP
     ips_to_query: list[str] = []
     for node in nodes:
         ip = node.get("ip") or node.get("remote_host") or ""
@@ -118,11 +98,8 @@ def enrich_ip_info(nodes: list[dict[str, Any]], timeout: float = 15.0) -> None:
         else:
             if ip not in ips_to_query:
                 ips_to_query.append(ip)
-
     if not ips_to_query:
         return
-
-    # 批量查询
     new_entries: dict[str, dict] = {}
     chunk_size = 100
     for i in range(0, len(ips_to_query), chunk_size):
@@ -161,15 +138,11 @@ def enrich_ip_info(nodes: list[dict[str, Any]], timeout: float = 15.0) -> None:
                 new_entries[query_ip] = entry
         except Exception as e:
             print(f"[enrich_ip_info] 批量查询失败: {e}", flush=True)
-
-    # 更新缓存
     if new_entries:
         with _ip_cache_lock:
             cache = _load_ip_cache()
             cache.update(new_entries)
             _save_ip_cache(cache)
-
-    # 填充节点
     for node in nodes:
         ip = node.get("ip") or node.get("remote_host") or ""
         if ip in new_entries:
@@ -195,7 +168,6 @@ def _set_unknown(node: dict) -> None:
     node.setdefault("ip_type",    "unknown")
     node.setdefault("quality",    "未知")
 
-# ── OpenVPN 配置解析 ────────────────────────────────────────────────
 def parse_remote(config_text: str, fallback_ip: str = "") -> tuple[str, int, str]:
     host, port, proto = fallback_ip, 1194, "udp"
     for line in config_text.splitlines():
@@ -221,18 +193,37 @@ def is_config_tcp(config_text: str) -> bool:
             return True
     return False
 
-# ── 延迟测试 ────────────────────────────────────────────────────────
-def ping_latency_ms(host: str, port: int, fallback: int = 0, timeout: float = 4.0) -> int:
+def ping_latency_ms(host: str, port: int, proto: str = "tcp",
+                    fallback: int = 0, timeout: float = 4.0) -> int:
+    """
+    延迟测试：TCP节点用TCP连接测试，UDP节点用ICMP ping测试。
+    返回毫秒延迟，失败返回fallback（0表示不可达）。
+    """
+    if proto == "tcp":
+        # TCP连接测试
+        try:
+            t0 = time.monotonic()
+            sock = socket.create_connection((host, port), timeout=timeout)
+            latency = max(1, int((time.monotonic() - t0) * 1000))
+            sock.close()
+            return latency
+        except Exception:
+            pass
+        # TCP失败，用ICMP备用
+    # ICMP ping测试（UDP节点或TCP失败时）
     try:
-        t0 = time.monotonic()
-        sock = socket.create_connection((host, port), timeout=timeout)
-        latency = max(1, int((time.monotonic() - t0) * 1000))
-        sock.close()
-        return latency
+        result = subprocess.run(
+            ["ping", "-c", "1", "-W", str(int(timeout)), host],
+            capture_output=True, text=True, timeout=timeout + 1
+        )
+        if result.returncode == 0:
+            m = re.search(r"time=(\d+\.?\d*)", result.stdout)
+            if m:
+                return max(1, int(float(m.group(1))))
     except Exception:
-        return fallback
+        pass
+    return fallback
 
-# ── DNS 修复 ────────────────────────────────────────────────────────
 def check_and_fix_dns() -> None:
     try:
         socket.setdefaulttimeout(3)
